@@ -16,6 +16,7 @@ eza 0.23.5 in [Limpet](https://tomaszstaniak.github.io/limpet/) 0.10.1 on AROS O
 | --- | --- |
 | AROS One and other ABIv11 systems, x86_64 | `Eza-0.23.5-r1-aros-x86_64-abiv11-pc.zip` |
 | mainline AROS (ABIv1), x86_64 | `Eza-0.23.5-r1-aros-x86_64-abiv1-pc.zip` |
+| native AROS on the Raspberry Pi (ABIv1, AArch64) | `Eza-0.23.5-r1-aros-aarch64-abiv1-raspi.zip` |
 
 With [apkg](https://github.com/tomaszstaniak/arospkg): `apkg install eza`.
 

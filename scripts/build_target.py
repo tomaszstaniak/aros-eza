@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Build eza for mainline AROS x86_64 (ABIv1). The Raspberry Pi target (AArch64 ABIv1) is work
-in progress: its std and libc differ, and that build does not complete yet.
+"""Build eza for mainline AROS (ABIv1): x86_64 PC and AArch64 Raspberry Pi.
 
 The ABIv11 executable is built by eza.py (byte-reproducible recipe). The two mainline targets
-follow the recipe the other Rust ports use with rust-aros: its target profile, libc-aros as the
-crates.io libc, and on AArch64 the C bridge of the std PAL linked before the SDK's libraries.
+use rust-aros the same way: its unix target profile and libc-aros as the crates.io libc.
 
     python3 scripts/build_target.py --target aros-x86_64-abiv1-pc --local local.v1.json
     python3 scripts/build_target.py --target aros-aarch64-abiv1-raspi --local local.raspi.json
 
-The local file names: aros_gcc, aros_ar, aros_sdk, rust_aros, rust_aros_commit, toolchain,
-and for AArch64 pomaros_hosted (clean checkout of the commit below) and glue_patches
-(directory with a series file). Output: build/<target>/eza and build/<target>/identity.json.
+The local file names: aros_gcc, aros_ar, aros_sdk, rust_aros, rust_aros_commit, toolchain and
+libc_patches (directory with a series file). Output: build/<target>/eza and build/<target>/identity.json.
 """
 import argparse, hashlib, io, json, os, re, shlex, shutil, subprocess, sys, tarfile, tempfile
 from pathlib import Path
@@ -21,13 +18,10 @@ import git_deps
 
 ROOT = port.ROOT
 RUSTC = "rustc 1.100.0-nightly (0dfb098f3 2026-08-31)"
-POMAROS_HOSTED = "3bc9359d439f9fb5655cf48924413ffe670931cc"
-GLUE = ("aros_fs_glue", "aros_thread_glue", "aros_sync_glue", "aros_env_glue",
-        "aros_process_glue", "aros_proc_glue", "aros_net_glue")
 # target -> rust-aros profile, Cargo target name, (EI_ABIVERSION, e_machine)
 TARGETS = {
     "aros-x86_64-abiv1-pc": ("x86_64-v1-pc", (1, 62)),
-    "aros-aarch64-abiv1-raspi": ("aarch64-v1-raspi", (1, 183)),
+    "aros-aarch64-abiv1-raspi": ("aarch64-v1-raspi-unix", (1, 183)),
 }
 
 
@@ -51,27 +45,6 @@ def tool(cfg, name):
     raise RuntimeError(f"cannot derive {name} from {driver}")
 
 
-def build_glue(cfg, root):
-    checkout = Path(cfg["pomaros_hosted"])
-    if out(["git", "-C", checkout, "rev-parse", "HEAD"], text=True).strip() != POMAROS_HOSTED or out(["git", "-C", checkout, "status", "--porcelain"], text=True):
-        raise RuntimeError(f"{checkout} must be a clean checkout of {POMAROS_HOSTED}")
-    patch_dir = ROOT / cfg["glue_patches"]
-    patches = [patch_dir / n for n in (patch_dir / "series").read_text().split()]
-    dest = root / "aros-glue"
-    if dest.exists():
-        shutil.rmtree(dest)
-    src = dest / "src/hosted/rust"
-    src.mkdir(parents=True)
-    for name in GLUE:
-        shutil.copy2(checkout / "hosted/rust" / f"{name}.c", src / f"{name}.c")
-    for patch in patches:
-        run(["patch", "--quiet", "-p1", "-i", patch], cwd=dest / "src")
-    for name in GLUE:
-        run([cfg["aros_gcc"], f"--sysroot={cfg['aros_sdk']}", "-O2", "-I", checkout / "hosted/rust", "-c", src / f"{name}.c", "-o", dest / f"{name}.o"])
-    return dest, {"pomaros_hosted_commit": POMAROS_HOSTED, "patches": {p.name: sha(p) for p in patches},
-                  "objects": {f"{n}.o": sha(dest / f"{n}.o") for n in GLUE}}
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--target", required=True, choices=sorted(TARGETS))
@@ -93,23 +66,18 @@ def main():
     rust, commit = Path(cfg["rust_aros"]), cfg["rust_aros_commit"]
     sysroot = Path(out(["rustc", "+" + cfg["toolchain"], "--print", "sysroot"], text=True).strip())
     record = {"target": a.target, "rust_aros_commit": commit, "toolchain": cfg["toolchain"], "rustc": RUSTC}
-    if raspi:
-        libc = sysroot / "lib/rustlib/src/rust/library/libc-aros"
-        if 'Ok("aarch64") { return; }' not in (libc / "build.rs").read_text():
-            raise RuntimeError(f"{libc} is not the common sysroot's aarch64 adaptation")
-    else:
-        libc = root / f"libc-aros-{commit[:12]}"
-        if libc.exists():
-            shutil.rmtree(libc)
-        with tempfile.TemporaryDirectory(prefix="libc-", dir=root) as tmp:
-            with tarfile.open(fileobj=io.BytesIO(out(["git", "-C", rust, "archive", "--format=tar", commit, "std-groundwork/libc-aros"]))) as tar:
-                tar.extractall(tmp, filter="data")
-            staged = Path(tmp) / "std-groundwork/libc-aros"
-            patch_dir = ROOT / cfg["libc_patches"]
-            for name in (patch_dir / "series").read_text().split():
-                run(["patch", "--quiet", "-p1", "-i", patch_dir / name], cwd=staged)
-                record.setdefault("libc_patches", {})[name] = sha(patch_dir / name)
-            staged.rename(libc)
+    libc = root / f"libc-aros-{commit[:12]}"
+    if libc.exists():
+        shutil.rmtree(libc)
+    with tempfile.TemporaryDirectory(prefix="libc-", dir=root) as tmp:
+        with tarfile.open(fileobj=io.BytesIO(out(["git", "-C", rust, "archive", "--format=tar", commit, "std-groundwork/libc-aros"]))) as tar:
+            tar.extractall(tmp, filter="data")
+        staged = Path(tmp) / "std-groundwork/libc-aros"
+        patch_dir = ROOT / cfg["libc_patches"]
+        for name in (patch_dir / "series").read_text().split():
+            run(["patch", "--quiet", "-p1", "-i", patch_dir / name], cwd=staged)
+            record.setdefault("libc_patches", {})[name] = sha(patch_dir / name)
+        staged.rename(libc)
     record["libc_aros"] = port.source_files(libc)
     # Build scripts and their dependencies (cc's jobserver) are compiled for the host with the
     # same crates.io libc entry: the dual crate is libc-aros for AROS and the registry libc
@@ -156,17 +124,17 @@ def main():
         git_crate = copy
         git_identity["extra_patch_sha256"] = sha(extra)
     target = json.loads(out(["git", "-C", rust, "show", f"{commit}:profiles/{profile}.json"]))
+    cc = cfg["aros_gcc"]
     if raspi:
-        glue_dir, record["glue"] = build_glue(cfg, root)
-        linker = root / "aarch64-aros-linker"
-        linker.write_text("#!/bin/sh\nset -e\nexec " + shlex.quote(cfg["aros_gcc"]) + ' "$@" -Wl,--no-gc-sections\n')
-        linker.chmod(0o755)
-        target["linker"] = str(linker)
-        target["no-default-libraries"] = False
-        target["pre-link-args"] = {"gnu-cc": [f"--sysroot={cfg['aros_sdk']}"] + [str(glue_dir / f"{n}.o") for n in GLUE]}
-    else:
-        target["linker"] = cfg["aros_gcc"]
-        target["pre-link-args"]["gnu-cc"] = [f"--sysroot={cfg['aros_sdk']}"]
+        # cc-rs derives a Clang --target from the Rust target; its "abiv1" environment is unknown
+        # to Clang, and the SDK's driver wrapper already selects the target.
+        wrapper = root / "aarch64-aros-cc"
+        wrapper.write_text("#!/bin/sh\nfor a do shift; case \"$a\" in --target=*) ;; *) set -- \"$@\" \"$a\" ;; esac; done\n"
+                           "exec " + shlex.quote(cc) + ' "$@"\n')
+        wrapper.chmod(0o755)
+        cc = str(wrapper)
+    target["linker"] = cc
+    target["pre-link-args"]["gnu-cc"] = [f"--sysroot={cfg['aros_sdk']}"]
     target["late-link-args"] = {"gnu-cc": ["-lpthread"]}
     # Build scripts (libgit2-sys) recognise AROS by the target name.
     tname = ("aarch64" if raspi else "x86_64") + "-aros"
@@ -176,7 +144,7 @@ def main():
     cflags = [f"--sysroot={cfg['aros_sdk']}", "-fno-pic", f"-ffile-prefix-map={root}=/eza-build"] + ([] if raspi else ["-mcmodel=large"])
     env = dict(os.environ, LIBZ_SYS_STATIC="1", CARGO_HOME=str(cargo_home), CARGO_TARGET_DIR=str(root / "target"),
                AROS_GCC=cfg["aros_gcc"], AROS_AR=cfg["aros_ar"], AROS_SDK=cfg["aros_sdk"], EZA_LIMPET_SDK=str(sdk))
-    env.update({f"CC_{triple}": cfg["aros_gcc"], f"AR_{triple}": cfg["aros_ar"], f"CFLAGS_{triple}": " ".join(cflags)})
+    env.update({f"CC_{triple}": cc, f"AR_{triple}": cfg["aros_ar"], f"CFLAGS_{triple}": " ".join(cflags)})
     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"):
         env.pop(name, None)
     flags = ["-Cpanic=abort", f"--remap-path-prefix={root}=/eza-build", f"--remap-path-prefix={libc}=/libc-aros", f"--remap-path-prefix={aros_libc}=/libc-aros",

@@ -77,17 +77,25 @@ SHA256SUMS only gains lines.
 
 ## Mainline AROS (ABIv1)
 
-`scripts/build_target.py` builds the mainline x86_64 executable. It follows
-the recipe of the other Rust ports built with rust-aros: the target profile
-`profiles/x86_64-v1-pc.json` and `std-groundwork/libc-aros` of the rust-aros
-commit named in the local file, with the patches in `patches/platform/libc-aros`,
-wrapped by `tools/libc-dual.py` so that build scripts compiled for the host
-keep the registry libc. Copy `local.v1.example.json`, fill in the paths, then:
+`scripts/build_target.py` builds the mainline executables for x86_64 PC and
+for the Raspberry Pi (AArch64). Both follow the recipe of the other Rust ports
+built with rust-aros: a unix target profile (`profiles/x86_64-v1-pc.json`,
+`profiles/aarch64-v1-raspi-unix.json`) and `std-groundwork/libc-aros` of the
+rust-aros commit named in the local file, with the patches in
+`patches/platform/libc-aros`, wrapped by `tools/libc-dual.py` so that build
+scripts compiled for the host keep the registry libc. Copy
+`local.v1.example.json` or `local.raspi.example.json`, fill in the paths, then:
 
 ```
 python3 scripts/build_target.py --target aros-x86_64-abiv1-pc --local local.v1.json
 python3 scripts/release.py aros-x86_64-abiv1-pc REVISION
 ```
+
+The Pi build needs a toolchain made by rust-aros `tools/common-sysroot.py` at
+42e16d9 or later. Its C compiler is Clang, which refuses implicit function
+declarations: `patches/deps/libgit2-sys-0.18.5-aros-process.patch` compiles
+out libgit2's helper-program code (`fork`, `sigwait`), which a local-repository
+build never reaches.
 
 The result and its record are `build/<target>/eza` and `identity.json`. This
 recipe is not the byte-reproducible one of the ABIv11 build. `release.py`

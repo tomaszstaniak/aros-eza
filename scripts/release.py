@@ -81,15 +81,12 @@ def main():
             # The ABIv11 recipe's inputs do not describe this build.
             (source / "rust-aros-inputs.tar.gz").unlink()
             public = {k: identity[k] for k in ("target", "rust_aros_commit", "rustc", "gcc", "libc_version", "libc_patches",
-                                               "glue", "binary_sha256", "bytes", "features", "upstream", "git_dependency",
+                                               "binary_sha256", "bytes", "features", "upstream", "git_dependency",
                                                "target_json_sha256", "presentation_sdk_pin") if k in identity}
             public["sdk"] = Path(identity["sdk"]).parent.name
             (source / "BUILD.json").write_text(json.dumps(public, indent=2) + "\n")
             shutil.copy2(ROOT / "scripts" / "build_target.py", source / "build_target.py")
-            for sub in ("libc-aros", "aros-glue"):
-                if sub == "aros-glue" and not target.endswith("-raspi"):
-                    continue
-                shutil.copytree(ROOT / "patches" / "platform" / sub, source / "patches" / "platform" / sub)
+            shutil.copytree(ROOT / "patches/platform/libc-aros", source / "patches/platform/libc-aros")
             if target.endswith("-raspi"):
                 shutil.copy2(ROOT / "patches/deps/libgit2-sys-0.18.5-aros-process.patch", source / "patches" / "deps")
             (source / "README.txt").write_text(

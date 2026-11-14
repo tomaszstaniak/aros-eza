@@ -3,8 +3,7 @@
   "aros_ar": "/path/to/aarch64-aros-ar",
   "aros_sdk": "/path/to/matching/Developer",
   "rust_aros": "/path/to/rust-aros",
-  "rust_aros_commit": "bf47cdfb60084264256399dd47fcf4a5dbd71dab",
-  "toolchain": "aros-v1-x86-gate-20261028",
-  "pomaros_hosted": "/path/to/pomaros-hosted",
-  "glue_patches": "patches/platform/aros-glue"
+  "rust_aros_commit": "42e16d905418aefad1d0cde1cd935d82b0ad0620",
+  "toolchain": "aros-common-20261114",
+  "libc_patches": "patches/platform/libc-aros"
 }
