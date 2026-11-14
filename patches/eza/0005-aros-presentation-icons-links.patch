@@ -1,0 +1,772 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] AROS: gate styles, icons and OSC 8 links on console capabilities
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001 0002 0003 0004
+Upstream-Status: AROS-specific, not for upstream
+Scope: target_os = "aros" only, except formatting of src/aros.rs and pure
+helpers in src/aros_policy.rs that are unit tested on the host.
+
+The candidate refused --icons and --hyperlink outright and passed every SGR
+attribute through. Limpet's presentation query (SDK tty_control.h,
+XTY_PRESENT_KNOWN_* and XTY_FEATURE_*) now reports which style resets,
+OSC 8 and the eza Nerd Font repertoire with one-cell icons are available.
+- Output drops SGR attributes whose style bit is not confirmed, keeps colour
+  arguments, and passes OSC 8 only when XTY_FEATURE_OSC8 is confirmed;
+  sequences split across writes are reassembled, oversized ones discarded.
+- Icons are enabled only when both XTY_FEATURE_NERD_ICONS_EZA and
+  XTY_FEATURE_ICON_WIDTH_ONE are set; otherwise the option is ignored.
+- Hyperlinks use file:///VOLUME:path with every byte outside unreserved,
+  "/" and ":" percent-encoded (spaces, "#", "?", "%", non-ASCII).
+- filename() keeps names ending in "//" (parent references) whole, escaping
+  invalid bytes in them as elsewhere.
+- Cargo.lock: libgit2-sys 0.18.5+1.9.4 is supplied by a path patch carrying
+  the AROS local-repository build (patches/deps), so source and checksum are
+  omitted; the version stays pinned.
+
+Verification: host tests in src/aros_policy.rs. Native behaviour is recorded
+in the port's validation documents; host tests do not establish it.
+Removal: none planned; adapt when the presentation contract changes.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 6457d8b..24cf447 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -703,8 +703,6 @@ version = "0.2.189"
+ [[package]]
+ name = "libgit2-sys"
+ version = "0.18.5+1.9.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "005d6ae6eac1912906073e069f7db60b1fa98e052a68227824afe3e3a1c59ca2"
+ dependencies = [
+  "cc",
+  "libc",
+diff --git a/src/aros.rs b/src/aros.rs
+index c474549..c63e72b 100644
+--- a/src/aros.rs
++++ b/src/aros.rs
+@@ -1,32 +1,80 @@
+ // SPDX-License-Identifier: EUPL-1.2
+-use crate::aros_policy::{Presentation,rich_width};
++use crate::aros_policy::{Presentation, rich_width};
+ use std::sync::OnceLock;
+-#[link(name="ezaaros",kind="static")]
+-unsafe extern "C" { fn eza_query(p:*mut Presentation)->i32; fn eza_break()->i32; fn eza_protection(path:*const std::ffi::c_char,bits:*mut u32)->i32; }
+-static WIDTH:OnceLock<Option<usize>>=OnceLock::new();
+-pub fn width()->Option<usize>{*WIDTH.get_or_init(||{let mut p=Presentation::default();let status=unsafe{eza_query(&mut p)};rich_width(status,p)})}
+-pub fn initialize(){
+- use std::io::IsTerminal;
+- if std::io::stdout().is_terminal() && width().is_none(){
+-  eprintln!("eza: This console does not provide the required colour and size capabilities. Run eza in Limpet or another compatible console.");std::process::exit(5);
+- }
++#[link(name = "ezaaros", kind = "static")]
++unsafe extern "C" {
++    fn eza_query(p: *mut Presentation) -> i32;
++    fn eza_break() -> i32;
++    fn eza_protection(path: *const std::ffi::c_char, bits: *mut u32) -> i32;
++}
++static WIDTH: OnceLock<Option<usize>> = OnceLock::new();
++pub fn width() -> Option<usize> {
++    *WIDTH.get_or_init(|| {
++        let mut p = Presentation::default();
++        let status = unsafe { eza_query(&mut p) };
++        rich_width(status, p)
++    })
++}
++pub fn initialize() {
++    use std::io::IsTerminal;
++    if std::io::stdout().is_terminal() && width().is_none() {
++        eprintln!(
++            "eza: This console does not provide the required colour and size capabilities. Run eza in Limpet or another compatible console."
++        );
++        std::process::exit(5);
++    }
++}
+ 
++pub fn interrupted() {
++    if unsafe { eza_break() } != 0 {
++        use std::io::{IsTerminal, Write};
++        if std::io::stdout().is_terminal() && width().is_some() {
++            let _ = std::io::stdout().write_all(b"\x1b[0m\n");
++        }
++        eprintln!("eza: Interrupted");
++        std::process::exit(5);
++    }
++}
++pub fn native_protection(path: &std::path::Path) -> Option<u32> {
++    use std::os::unix::ffi::OsStrExt;
++    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
++    let mut bits = 0;
++    if unsafe { eza_protection(path.as_ptr(), &mut bits) } != 0 {
++        Some(bits)
++    } else {
++        None
++    }
+ }
+ 
+-pub fn interrupted(){if unsafe{eza_break()}!=0 {
+- use std::io::{IsTerminal,Write};
+- if std::io::stdout().is_terminal() && width().is_some(){let _=std::io::stdout().write_all(b"\x1b[0m\n");}
+- eprintln!("eza: Interrupted");std::process::exit(5);
+-}}
+-pub fn native_protection(path:&std::path::Path)->Option<u32>{
+- use std::os::unix::ffi::OsStrExt;
+- let path=std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;let mut bits=0;
+- if unsafe{eza_protection(path.as_ptr(),&mut bits)}!=0 {Some(bits)}else{None}
++pub fn writer() -> crate::aros_policy::Output<std::io::Stdout> {
++    use std::io::IsTerminal;
++    let mut p = Presentation::default();
++    let rich = std::io::stdout().is_terminal();
++    if rich {
++        unsafe { eza_query(&mut p) };
++    }
++    crate::aros_policy::Output::new(
++        std::io::stdout(),
++        rich && rich_width(0, p).is_some(),
++        p.colors == 3,
++    )
++    .capabilities(p)
+ }
+ 
+-pub fn writer()->crate::aros_policy::Output<std::io::Stdout>{
+- use std::io::IsTerminal;
+- let mut p=Presentation::default();let rich=std::io::stdout().is_terminal();
+- if rich {unsafe{eza_query(&mut p)};}
+- crate::aros_policy::Output::new(std::io::stdout(),rich,p.colors==3)
++fn output_presentation() -> Presentation {
++    use std::io::IsTerminal;
++    let mut p = Presentation::default();
++    if std::io::stdout().is_terminal() && unsafe { eza_query(&mut p) } == 0 {
++        p
++    } else {
++        Presentation::default()
++    }
++}
++pub fn hyperlinks() -> bool {
++    let p = output_presentation();
++    p.known & 64 != 0 && p.features & 2 != 0
++}
++pub fn icons() -> bool {
++    let p = output_presentation();
++    p.known & 64 != 0 && p.features & 12 == 12
+ }
+diff --git a/src/aros_policy.rs b/src/aros_policy.rs
+index 14bfa51..c179914 100644
+--- a/src/aros_policy.rs
++++ b/src/aros_policy.rs
+@@ -1,80 +1,482 @@
+ // SPDX-License-Identifier: EUPL-1.2
+ #[derive(Default, Debug, Clone, Copy)]
+ #[repr(C)]
+-pub struct Presentation { pub known:u32, pub colors:u32, pub styles:u32, pub lines:u32, pub rows:u32, pub columns:u32, pub interpretation:u32, pub input:u32, pub features:u32 }
+-pub fn rich_width(status:i32, p:Presentation)->Option<usize>{
+- if status == 0 && p.known & 9 == 9 && (2..=3).contains(&p.colors) && p.rows > 0 && p.columns > 0 {Some(p.columns as usize)} else {None}
++pub struct Presentation {
++    pub known: u32,
++    pub colors: u32,
++    pub styles: u32,
++    pub lines: u32,
++    pub rows: u32,
++    pub columns: u32,
++    pub interpretation: u32,
++    pub input: u32,
++    pub features: u32,
+ }
+-#[cfg(test)] mod tests {
+- use super::*;
+- fn compatible()->Presentation { Presentation {known:9, colors:2, rows:24, columns:80,..Default::default()} }
+- #[test] fn accepts_any_console_with_contract(){assert_eq!(rich_width(0,compatible()),Some(80));}
+- #[test] fn ignores_unknown_bits(){let mut p=compatible();p.known|=1<<31;assert_eq!(rich_width(0,p),Some(80));}
+- #[test] fn refuses_unknown_absent_or_invalid(){for p in [Presentation::default(),Presentation{known:1,..compatible()},Presentation{rows:0,..compatible()},Presentation{colors:1,..compatible()},Presentation{colors:99,..compatible()}]{assert_eq!(rich_width(0,p),None);}assert_eq!(rich_width(1,compatible()),None);}
++pub fn rich_width(status: i32, p: Presentation) -> Option<usize> {
++    if status == 0 && p.known & 9 == 9 && (2..=3).contains(&p.colors) && p.rows > 0 && p.columns > 0
++    {
++        Some(p.columns as usize)
++    } else {
++        None
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn compatible() -> Presentation {
++        Presentation {
++            known: 9,
++            colors: 2,
++            rows: 24,
++            columns: 80,
++            ..Default::default()
++        }
++    }
++    #[test]
++    fn accepts_any_console_with_contract() {
++        assert_eq!(rich_width(0, compatible()), Some(80));
++    }
++    #[test]
++    fn ignores_unknown_bits() {
++        let mut p = compatible();
++        p.known |= 1 << 31;
++        assert_eq!(rich_width(0, p), Some(80));
++    }
++    #[test]
++    fn refuses_unknown_absent_or_invalid() {
++        for p in [
++            Presentation::default(),
++            Presentation {
++                known: 1,
++                ..compatible()
++            },
++            Presentation {
++                rows: 0,
++                ..compatible()
++            },
++            Presentation {
++                colors: 1,
++                ..compatible()
++            },
++            Presentation {
++                colors: 99,
++                ..compatible()
++            },
++        ] {
++            assert_eq!(rich_width(0, p), None);
++        }
++        assert_eq!(rich_width(1, compatible()), None);
++    }
++}
++
++pub fn sgr(params: &str, rgb: bool) -> String {
++    let parts: Vec<u32> = params.split(';').map(|v| v.parse().unwrap_or(0)).collect();
++    let mut out = Vec::new();
++    let mut i = 0;
++    while i < parts.len() {
++        let v = parts[i];
++        if (v == 38 || v == 48) && i + 2 < parts.len() && parts[i + 1] == 5 {
++            out.extend(parts[i..i + 3].iter().map(u32::to_string));
++            i += 3;
++            continue;
++        }
++        if (v == 38 || v == 48) && i + 4 < parts.len() && parts[i + 1] == 2 {
++            if rgb {
++                out.extend(parts[i..i + 5].iter().map(u32::to_string));
++            } else {
++                let q = |x: u32| (x.min(255) * 5 + 127) / 255;
++                let n = 16 + 36 * q(parts[i + 2]) + 6 * q(parts[i + 3]) + q(parts[i + 4]);
++                out.extend([v.to_string(), "5".into(), n.to_string()]);
++            }
++            i += 5;
++            continue;
++        }
++        let pair = match v {
++            30..=37 => Some((38, v - 30)),
++            40..=47 => Some((48, v - 40)),
++            90..=97 => Some((38, v - 90 + 8)),
++            100..=107 => Some((48, v - 100 + 8)),
++            _ => None,
++        };
++        if let Some((kind, n)) = pair {
++            out.extend([kind.to_string(), "5".into(), n.to_string()]);
++        } else {
++            out.push(v.to_string());
++        }
++        i += 1;
++    }
++    out.join(";")
++}
++pub fn protection(bits: u32) -> String {
++    "hsparwed"
++        .chars()
++        .enumerate()
++        .map(|(i, c)| {
++            let set = bits & (1 << (7 - i)) != 0;
++            if set == (i < 4) { c } else { '-' }
++        })
++        .collect()
++}
++#[cfg(test)]
++mod more_tests {
++    use super::*;
++    #[test]
++    fn maps_amiga_pens_without_rewriting_index_arguments() {
++        assert_eq!(sgr("1;34;48;5;31", false), "1;38;5;4;48;5;31");
++        assert_eq!(sgr("91;104", true), "38;5;9;48;5;12");
++    }
++    #[test]
++    fn reduces_rgb_only_when_unconfirmed() {
++        assert_eq!(sgr("38;2;255;0;0", false), "38;5;196");
++        assert_eq!(sgr("38;2;255;0;0", true), "38;2;255;0;0");
++    }
++    #[test]
++    fn displays_native_protection_in_dos_order() {
++        assert_eq!(protection(0), "----rwed");
++        assert_eq!(protection(0xff), "hspa----");
++        assert_eq!(protection(8), "-----wed");
++    }
++}
++
++/// A streaming filter: retain incomplete control strings across writes and
++/// discard their payload until termination, including after the bounded buffer fills.
++pub struct Output<W: std::io::Write> {
++    pub inner: W,
++    pub rich: bool,
++    pub rgb: bool,
++    styles: u32,
++    hyperlinks: bool,
++    pending: Vec<u8>,
++    state: u8,
++    overflow: bool,
++}
++impl<W: std::io::Write> Output<W> {
++    pub fn new(inner: W, rich: bool, rgb: bool) -> Self {
++        Self {
++            inner,
++            rich,
++            rgb,
++            styles: 0,
++            hyperlinks: false,
++            pending: Vec::new(),
++            state: 0,
++            overflow: false,
++        }
++    }
++    pub fn capabilities(mut self, p: Presentation) -> Self {
++        self.styles = if p.known & 2 != 0 { p.styles } else { 0 };
++        self.hyperlinks = p.known & 64 != 0 && p.features & 2 != 0;
++        self
++    }
++    fn sequence(&mut self, output: &mut Vec<u8>, osc: bool) {
++        if !self.overflow && self.rich {
++            if osc {
++                if self.hyperlinks && self.pending.starts_with(b"\x1b]8;") {
++                    output.extend_from_slice(&self.pending);
++                }
++            } else if self.pending.last() == Some(&b'm') {
++                if let Ok(params) = std::str::from_utf8(&self.pending[2..self.pending.len() - 1]) {
++                    if params.bytes().all(|b| b.is_ascii_digit() || b == b';') {
++                        let mapped = sgr(params, self.rgb);
++                        let parts: Vec<&str> = mapped.split(';').collect();
++                        let mut kept = Vec::new();
++                        let mut i = 0;
++                        while i < parts.len() {
++                            let v = parts[i].parse::<u32>().unwrap_or(0);
++                            if (v == 38 || v == 48) && i + 2 < parts.len() {
++                                let n = if parts[i + 1] == "2" { 5 } else { 3 };
++                                if i + n <= parts.len() {
++                                    kept.extend_from_slice(&parts[i..i + n]);
++                                    i += n;
++                                    continue;
++                                }
++                            }
++                            let allowed = match v {
++                                0 | 39 | 49 => true,
++                                1 => self.styles & 1 != 0,
++                                22 => self.styles & 3 != 0,
++                                2 => self.styles & 2 != 0,
++                                3 | 23 => self.styles & 4 != 0,
++                                4 | 24 => self.styles & 8 != 0,
++                                5 | 25 => self.styles & 16 != 0,
++                                7 | 27 => self.styles & 32 != 0,
++                                8 | 28 => self.styles & 64 != 0,
++                                9 | 29 => self.styles & 128 != 0,
++                                _ => false,
++                            };
++                            if allowed {
++                                kept.push(parts[i]);
++                            }
++                            i += 1;
++                        }
++                        if !kept.is_empty() {
++                            output
++                                .extend_from_slice(format!("\x1b[{}m", kept.join(";")).as_bytes());
++                        }
++                    }
++                }
++            }
++        }
++        self.pending.clear();
++        self.state = 0;
++        self.overflow = false;
++    }
++}
++impl<W: std::io::Write> std::io::Write for Output<W> {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        #[cfg(target_os = "aros")]
++        crate::aros::interrupted();
++        let mut output = Vec::with_capacity(bytes.len());
++        for &b in bytes {
++            if self.state == 0 {
++                if b == 27 {
++                    self.pending.push(b);
++                    self.state = 1;
++                } else {
++                    output.push(b);
++                }
++                continue;
++            }
++            if self.pending.len() < 8192 {
++                self.pending.push(b);
++            } else {
++                self.overflow = true;
++            }
++            match self.state {
++                1 => match b {
++                    b'[' => self.state = 2,
++                    b']' => self.state = 3,
++                    b'P' | b'X' | b'^' | b'_' => self.state = 5,
++                    _ => {
++                        self.pending.clear();
++                        self.state = 0;
++                    }
++                },
++                2 => {
++                    if (0x40..=0x7e).contains(&b) {
++                        self.sequence(&mut output, false);
++                    }
++                }
++                3 | 4 => {
++                    if b == 7 || (self.state == 4 && b == b'\\') {
++                        self.sequence(&mut output, true);
++                    } else {
++                        self.state = if b == 27 { 4 } else { 3 };
++                    }
++                }
++                5 | 6 => {
++                    if self.state == 6 && b == b'\\' {
++                        self.pending.clear();
++                        self.state = 0;
++                        self.overflow = false;
++                    } else {
++                        self.state = if b == 27 { 6 } else { 5 };
++                    }
++                }
++                _ => unreachable!(),
++            }
++        }
++        self.inner.write_all(&output)?;
++        Ok(bytes.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> {
++        self.inner.flush()
++    }
++}
++#[cfg(test)]
++mod writer_tests {
++    use super::*;
++    use std::io::Write;
++    #[test]
++    fn split_sequences_map_and_plain_strips() {
++        for rich in [false, true] {
++            let mut w = Output::new(Vec::new(), rich, false);
++            for chunk in [b"\x1b[3".as_slice(), b"4mname\x1b[0m\n"] {
++                w.write_all(chunk).unwrap();
++            }
++            assert_eq!(
++                w.inner,
++                if rich {
++                    b"\x1b[38;5;4mname\x1b[0m\n".to_vec()
++                } else {
++                    b"name\n".to_vec()
++                }
++            );
++        }
++    }
++}
++
++pub fn filename(bytes: &[u8]) -> String {
++    let parent = bytes.ends_with(b"//");
++    let bytes = if !parent && bytes.len() > 1 && bytes.ends_with(b"/") {
++        &bytes[..bytes.len() - 1]
++    } else {
++        bytes
++    };
++    let end = bytes.len();
++    let mut start = bytes
++        .iter()
++        .rposition(|b| *b == b'/' || *b == b':')
++        .map_or(0, |i| i + 1);
++    if parent || start == end {
++        start = 0;
++    }
++    let mut input = &bytes[start..];
++    let mut out = String::new();
++    while !input.is_empty() {
++        match std::str::from_utf8(input) {
++            Ok(text) => {
++                out.push_str(text);
++                break;
++            }
++            Err(e) => {
++                let valid = e.valid_up_to();
++                out.push_str(std::str::from_utf8(&input[..valid]).unwrap());
++                let n = e.error_len().unwrap_or(input.len() - valid);
++                for b in &input[valid..valid + n] {
++                    out.push_str(&format!("\\x{b:02x}"));
++                }
++                input = &input[valid + n..];
++            }
++        }
++    }
++    out
++}
++#[cfg(test)]
++mod path_tests {
++    use super::*;
++    #[test]
++    fn amiga_names_and_invalid_bytes_are_preserved() {
++        assert_eq!(filename(b"RAM:folder/file name"), "file name");
++        assert_eq!(filename(b"RAM:one"), "one");
++        assert_eq!(filename(b"SYS:"), "SYS:");
++        assert_eq!(filename(b"a/\xff.bin"), "\\xff.bin");
++        assert_eq!(filename("RAM:zażółć".as_bytes()), "zażółć");
++    }
++}
++
++#[cfg(test)]
++mod trailing_tests {
++    use super::*;
++    #[test]
++    fn directory_separator_and_parent_references() {
++        assert_eq!(filename(b"RAM:a/b/"), "b");
++        assert_eq!(filename(b"RAM:a//"), "RAM:a//");
++        assert_eq!(filename(b"/"), "/");
++        assert_eq!(filename(b"RAM:"), "RAM:");
++    }
+ }
+ 
+-pub fn sgr(params:&str,rgb:bool)->String{
+- let parts:Vec<u32>=params.split(';').map(|v|v.parse().unwrap_or(0)).collect();
+- let mut out=Vec::new();let mut i=0;
+- while i<parts.len(){let v=parts[i];
+-  if (v==38||v==48)&&i+2<parts.len()&&parts[i+1]==5 {out.extend(parts[i..i+3].iter().map(u32::to_string));i+=3;continue;}
+-  if (v==38||v==48)&&i+4<parts.len()&&parts[i+1]==2 {
+-   if rgb {out.extend(parts[i..i+5].iter().map(u32::to_string));}
+-   else {let q=|x:u32|(x.min(255)*5+127)/255;let n=16+36*q(parts[i+2])+6*q(parts[i+3])+q(parts[i+4]);out.extend([v.to_string(),"5".into(),n.to_string()]);}i+=5;continue;
+-  }
+-  let pair=match v{30..=37=>Some((38,v-30)),40..=47=>Some((48,v-40)),90..=97=>Some((38,v-90+8)),100..=107=>Some((48,v-100+8)),_=>None};
+-  if let Some((kind,n))=pair{out.extend([kind.to_string(),"5".into(),n.to_string()]);}else{out.push(v.to_string());}i+=1;
+- }out.join(";")
+-}
+-pub fn protection(bits:u32)->String{
+- "hsparwed".chars().enumerate().map(|(i,c)|{let set=bits&(1<<(7-i))!=0;if set==(i<4){c}else{'-'}}).collect()
+-}
+-#[cfg(test)] mod more_tests {
+- use super::*;
+- #[test] fn maps_amiga_pens_without_rewriting_index_arguments(){assert_eq!(sgr("1;34;48;5;31",false),"1;38;5;4;48;5;31");assert_eq!(sgr("91;104",true),"38;5;9;48;5;12");}
+- #[test] fn reduces_rgb_only_when_unconfirmed(){assert_eq!(sgr("38;2;255;0;0",false),"38;5;196");assert_eq!(sgr("38;2;255;0;0",true),"38;2;255;0;0");}
+- #[test] fn displays_native_protection_in_dos_order(){assert_eq!(protection(0),"----rwed");assert_eq!(protection(0xff),"hspa----");assert_eq!(protection(8),"-----wed");}
++#[cfg(test)]
++mod contract_regression_tests {
++    use super::*;
++    use std::io::Write;
++    #[test]
++    fn unconfirmed_styles_are_stripped() {
++        let mut w = Output::new(Vec::new(), true, false);
++        w.write_all(b"\x1b[1;3;4;5;7;8;9;34mname\x1b[22;23;24;25;27;28;29m")
++            .unwrap();
++        assert_eq!(w.inner, b"\x1b[38;5;4mname");
++    }
++    #[test]
++    fn osc_payload_never_leaks() {
++        for split in 0..30 {
++            let bytes = b"\x1b]8;;file:///RAM:a\x1b\\name\x1b]8;;\x1b\\";
++            let mut w = Output::new(Vec::new(), false, false);
++            let at = split.min(bytes.len());
++            w.write_all(&bytes[..at]).unwrap();
++            w.write_all(&bytes[at..]).unwrap();
++            assert_eq!(w.inner, b"name");
++        }
++    }
+ }
+ 
+-pub struct Output<W:std::io::Write>{pub inner:W,pub rich:bool,pub rgb:bool,pending:Vec<u8>}
+-impl<W:std::io::Write> Output<W>{pub fn new(inner:W,rich:bool,rgb:bool)->Self{Self{inner,rich,rgb,pending:Vec::new()}}}
+-impl<W:std::io::Write> std::io::Write for Output<W>{
+- fn write(&mut self,bytes:&[u8])->std::io::Result<usize>{
+- #[cfg(target_os="aros")] crate::aros::interrupted();
+- let mut output=Vec::with_capacity(bytes.len());
+- for &b in bytes {
+-  if self.pending.is_empty(){if b==27 {self.pending.push(b);}else{output.push(b);}continue;}
+-  self.pending.push(b);
+-  if self.pending.len()==2 && b!=b'[' {self.pending.clear();continue;}
+-  if self.pending.len()>2 && (0x40..=0x7e).contains(&b){
+-   if b==b'm' && self.rich {let params=std::str::from_utf8(&self.pending[2..self.pending.len()-1]).unwrap_or("");output.extend_from_slice(format!("\x1b[{}m",sgr(params,self.rgb)).as_bytes());}
+-   self.pending.clear();
+-  }else if self.pending.len()>256 {self.pending.clear();}
+- }
+- self.inner.write_all(&output)?;Ok(bytes.len())
+-}
+- fn flush(&mut self)->std::io::Result<()>{self.inner.flush()}
+-}
+-#[cfg(test)] mod writer_tests{
+- use super::*;use std::io::Write;
+- #[test]fn split_sequences_map_and_plain_strips(){for rich in [false,true]{let mut w=Output::new(Vec::new(),rich,false);for chunk in [b"\x1b[3".as_slice(),b"4mname\x1b[0m\n"]{w.write_all(chunk).unwrap();}assert_eq!(w.inner,if rich{b"\x1b[38;5;4mname\x1b[0m\n".to_vec()}else{b"name\n".to_vec()});}}
++#[cfg(test)]
++mod confirmed_contract_tests {
++    use super::*;
++    use std::io::Write;
++    #[test]
++    fn styles_require_their_own_bits() {
++        let p = Presentation {
++            known: 2,
++            styles: 1 | 8 | 32,
++            ..Default::default()
++        };
++        let mut w = Output::new(Vec::new(), true, false).capabilities(p);
++        w.write_all(b"\x1b[1;2;3;4;5;7;8;9;22;23;24;25;27;28;29m")
++            .unwrap();
++        assert_eq!(w.inner, b"\x1b[1;4;7;22;24;27m");
++    }
++    #[test]
++    fn confirmed_osc8_survives_every_write_boundary() {
++        for bytes in [
++            b"\x1b]8;;file:///RAM:a\x1b\\name\x1b]8;;\x1b\\".as_slice(),
++            b"\x1b]8;;file:///RAM:a\x07name\x1b]8;;\x07".as_slice(),
++        ] {
++            for at in 0..=bytes.len() {
++                for rich in [false, true] {
++                    let p = Presentation {
++                        known: 64,
++                        features: 2,
++                        ..Default::default()
++                    };
++                    let mut w = Output::new(Vec::new(), rich, false).capabilities(p);
++                    w.write_all(&bytes[..at]).unwrap();
++                    w.write_all(&bytes[at..]).unwrap();
++                    assert_eq!(
++                        w.inner,
++                        if rich {
++                            bytes.to_vec()
++                        } else {
++                            b"name".to_vec()
++                        }
++                    );
++                }
++            }
++        }
++    }
++    #[test]
++    fn oversized_osc_is_discarded_until_terminator() {
++        let mut w = Output::new(Vec::new(), false, false);
++        w.write_all(b"\x1b]8;;").unwrap();
++        w.write_all(&vec![b'a'; 9000]).unwrap();
++        w.write_all(b"\x1b\\name").unwrap();
++        assert_eq!(w.inner, b"name");
++    }
+ }
+ 
+-pub fn filename(bytes:&[u8])->String {
+- if bytes.ends_with(b"//") {return String::from_utf8_lossy(bytes).into_owned();}
+- let bytes=if bytes.len()>1 && bytes.ends_with(b"/") {&bytes[..bytes.len()-1]}else{bytes};
+- let end=bytes.len();let mut start=bytes.iter().rposition(|b| *b==b'/' || *b==b':').map_or(0,|i|i+1);
+- if start==end {start=0;}
+- let mut input=&bytes[start..];let mut out=String::new();
+- while !input.is_empty(){match std::str::from_utf8(input){Ok(text)=>{out.push_str(text);break;},Err(e)=>{
+- let valid=e.valid_up_to();out.push_str(std::str::from_utf8(&input[..valid]).unwrap());
+- let n=e.error_len().unwrap_or(input.len()-valid);for b in &input[valid..valid+n]{out.push_str(&format!("\\x{b:02x}"));}input=&input[valid+n..];
+- }}}out
+-}
+-#[cfg(test)] mod path_tests {use super::*;
+- #[test]fn amiga_names_and_invalid_bytes_are_preserved(){assert_eq!(filename(b"RAM:folder/file name"),"file name");assert_eq!(filename(b"RAM:one"),"one");assert_eq!(filename(b"SYS:"),"SYS:");assert_eq!(filename(b"a/\xff.bin"),"\\xff.bin");assert_eq!(filename("RAM:zażółć".as_bytes()),"zażółć");}
++#[cfg(test)]
++mod parent_bytes_tests {
++    use super::*;
++    #[test]
++    fn invalid_parent_bytes_are_escaped() {
++        assert_eq!(filename(b"RAM:\xff//"), "RAM:\\xff//");
++    }
+ }
+ 
+-#[cfg(test)] mod trailing_tests {use super::*;
+- #[test]fn directory_separator_and_parent_references(){assert_eq!(filename(b"RAM:a/b/"),"b");assert_eq!(filename(b"RAM:a//"),"RAM:a//");assert_eq!(filename(b"/"),"/");assert_eq!(filename(b"RAM:"),"RAM:");}
++pub fn file_uri(path: &str) -> String {
++    let mut uri = String::from("file:///");
++    for b in path.trim_start_matches('/').bytes() {
++        if b.is_ascii_alphanumeric() || b"-._~/:".contains(&b) {
++            uri.push(b as char);
++        } else {
++            uri.push_str(&format!("%{b:02X}"));
++        }
++    }
++    uri
++}
++#[cfg(test)]
++mod file_uri_tests {
++    use super::*;
++    #[test]
++    fn amiga_paths_are_local_uri_paths_with_escaped_bytes() {
++        assert_eq!(
++            file_uri("RAM:doc name#?%.txt"),
++            "file:///RAM:doc%20name%23%3F%25.txt"
++        );
++        assert_eq!(
++            file_uri("RAM:żółć.txt"),
++            "file:///RAM:%C5%BC%C3%B3%C5%82%C4%87.txt"
++        );
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index eaabbec..a65b98a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -65,10 +65,6 @@ fn main() {
+             #[cfg(target_os = "aros")]
+             {
+                 if !stdout_istty { options.theme.use_colours = crate::theme::UseColours::Never; }
+-                options.view.file_style.show_icons = crate::output::file_name::ShowIcons::Never;
+-                options.view.file_style.embed_hyperlinks = crate::output::file_name::EmbedHyperlinks::Never;
+-                if cli.get_one::<options::parser::ShowWhen>("icons").is_some_and(|v| !matches!(v, options::parser::ShowWhen::Never)) { eprintln!("eza: icons are not supported on this AROS build"); exit(5); }
+-                if cli.get_one::<options::parser::ShowWhen>("hyperlink").is_some_and(|v| !matches!(v, options::parser::ShowWhen::Never)) { eprintln!("eza: hyperlinks are not supported on this AROS build"); exit(5); }
+             }
+             if input_paths.is_empty() {
+                 match &options.stdin {
+diff --git a/src/options/file_name.rs b/src/options/file_name.rs
+index 1e8c161..709bf5e 100644
+--- a/src/options/file_name.rs
++++ b/src/options/file_name.rs
+@@ -20,9 +20,13 @@ impl Options {
+     ) -> Result<Self, OptionsError> {
+         let classify = Classify::deduce(matches);
+         let show_icons = ShowIcons::deduce(matches, vars)?;
++        #[cfg(target_os="aros")]
++        let show_icons = if crate::aros::icons() {show_icons}else{ShowIcons::Never};
+ 
+         let quote_style = QuoteStyle::deduce(matches);
+         let embed_hyperlinks = EmbedHyperlinks::deduce(matches);
++        #[cfg(target_os="aros")]
++        let embed_hyperlinks = if crate::aros::hyperlinks() {embed_hyperlinks}else{EmbedHyperlinks::Never};
+ 
+         let absolute = *matches.get_one("absolute").unwrap();
+         let short_nix = matches.get_flag("short-nix");
+diff --git a/src/output/escape.rs b/src/output/escape.rs
+index c0623a2..8d5af11 100644
+--- a/src/output/escape.rs
++++ b/src/output/escape.rs
+@@ -6,6 +6,7 @@
+ // SPDX-License-Identifier: MIT
+ use super::file_name::QuoteStyle;
+ use nu_ansi_term::{AnsiString as ANSIString, Style};
++#[cfg(not(target_os = "aros"))]
+ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+ 
+ pub fn escape(
+@@ -45,12 +46,19 @@ pub fn escape(
+     }
+ }
+ 
++#[cfg(not(target_os = "aros"))]
+ const HYPERLINK_ESCAPE_CHARS: &AsciiSet = &CONTROLS.add(b' ');
+ const HYPERLINK_OPENING_START: &str = "\x1B]8;;";
+ const HYPERLINK_OPENING_END: &str = "\x1B\x5C";
+ // Combination of both above tags
+ pub const HYPERLINK_CLOSING: &str = "\x1B]8;;\x1B\x5C";
+ 
++#[cfg(target_os = "aros")]
++pub fn get_hyperlink_start_tag(abs_path: &str) -> String {
++    format!("{HYPERLINK_OPENING_START}{}{HYPERLINK_OPENING_END}",crate::aros_policy::file_uri(abs_path))
++}
++
++#[cfg(not(target_os = "aros"))]
+ pub fn get_hyperlink_start_tag(abs_path: &str) -> String {
+     let abs_path = utf8_percent_encode(abs_path, HYPERLINK_ESCAPE_CHARS).to_string();
+ 

@@ -1,0 +1,7 @@
+FailAt 21
+Protect RAM:ezt/dirprobe-rust +e
+Protect RAM:ezt/dirprobe-c +e
+RAM:ezt/dirprobe-c fixture d8e4b3b
+Echo $RC >RESULTS:ez3-dpfix-d8e4b3b.rc
+RAM:ezt/dirprobe-rust hold d8e4b3
+Echo $RC >RESULTS:ez3-dprhold-d8e4b3.rc

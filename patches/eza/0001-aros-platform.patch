@@ -1,0 +1,612 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] Adapt eza platform boundaries for AROS ABIv11
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: none
+Upstream-Status: local-only
+Scope: x86_64 AROS ABIv11; other targets retain upstream implementations.
+
+Use Output() presentation capabilities and native DOS protection instead of
+unsupported Unix terminal/account interfaces. Keep redirection plain, map ANSI
+palette colours to indexed SGR, preserve AmigaDOS names and invalid bytes, and
+run directory formatting sequentially so global worker lifetime cannot prevent
+return to the Shell. Disable unsupported icons and hyperlinks explicitly.
+
+Verification: eight host policy tests pass; target links with the pinned
+rust-aros baseline. Initial native run passed help/version but exposed a
+worker-lifetime hang and volume-prefixed names. The sequential/name fixes
+require native rerun; this patch is not yet release-validated.
+Removal: replace individual adaptations when upstream supports the same AROS
+contracts and passes native regression coverage. No upstream submission made.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2c9ed44..6457d8b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -698,9 +698,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.182"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
++version = "0.2.189"
+ 
+ [[package]]
+ name = "libgit2-sys"
+diff --git a/Cargo.toml b/Cargo.toml
+index 737c70d..c1144bc 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -84,7 +84,7 @@ name = "eza"
+ 
+ 
+ [dependencies]
+-rayon = "1.10.0"
++
+ chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+ nu-ansi-term = { version = "0.50.1", features = [
+   "serde",
+@@ -103,14 +103,14 @@ percent-encoding = "2.3.1"
+ phf = { version = "0.13.1", features = ["macros"] }
+ plist = { version = "1.7.0", default-features = false }
+ uutils_term_grid = "0.7.0"
+-terminal_size = "0.4.2"
++
+ timeago = { version = "0.6.0", default-features = false }
+ unicode-width = "0.2"
+ ansi-width = "0.1.0"
+ serde = { version = "1.0.219", features = ["derive"] }
+ dirs = "6.0.0"
+ serde_norway = "0.9"
+-backtrace = "0.3"
++
+ clap = { version = "4.5.38", features = ["cargo", "derive"] }
+ 
+ [dependencies.git2]
+@@ -121,7 +121,12 @@ default-features = false
+ [target.'cfg(target_os = "linux")'.dependencies]
+ proc-mounts = "0.3"
+ 
+-[target.'cfg(unix)'.dependencies]
++[target.'cfg(not(target_os = "aros"))'.dependencies]
++rayon = "1.10.0"
++terminal_size = "0.4.2"
++backtrace = "0.3"
++
++[target.'cfg(all(unix, not(target_os = "aros")))'.dependencies]
+ uzers = "0.12.1"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+diff --git a/build.rs b/build.rs
+index b5237bd..445af85 100644
+--- a/build.rs
++++ b/build.rs
+@@ -25,6 +25,7 @@ use chrono::prelude::*;
+ /// The build script entry point.
+ fn main() -> io::Result<()> {
+     #![allow(clippy::write_with_newline)]
++    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("aros") { build_aros(); }
+ 
+     let tagline = "eza - A modern, maintained replacement for ls";
+     let url = "https://github.com/eza-community/eza";
+@@ -139,3 +140,23 @@ fn build_date() -> String {
+     let now = Local::now();
+     now.date_naive().format("%Y-%m-%d").to_string()
+ }
++
++fn build_aros() {
++ use std::process::Command;
++ let sdk=env::var("EZA_LIMPET_SDK").expect("set EZA_LIMPET_SDK to the pinned presentation SDK");
++ let cc=env::var("AROS_GCC").expect("set AROS_GCC");
++ let ar=env::var("AROS_AR").expect("set AROS_AR");
++ let aros_sdk=env::var("AROS_SDK").expect("set AROS_SDK");
++ let out=PathBuf::from(env::var("OUT_DIR").unwrap());
++ let mut objects=Vec::new();
++ for (i,file) in ["src/aros.c".to_string(),format!("{sdk}/src/limpet_query.c"),format!("{sdk}/src/limpet_format.c")].iter().enumerate() {
++  let obj=out.join(format!("aros{i}.o"));
++  assert!(Command::new(&cc).args([format!("--sysroot={aros_sdk}"),format!("-I{sdk}/include"),"-O2".into(),"-std=gnu11".into(),"-c".into(),file.clone(),"-o".into(),obj.display().to_string()]).status().unwrap().success());objects.push(obj);
++ }
++ let archive=out.join("libezaaros.a");
++ assert!(Command::new(ar).arg("rcs").arg(archive).args(objects).status().unwrap().success());
++ println!("cargo:rustc-link-search=native={}",out.display());println!("cargo:rustc-link-lib=static=ezaaros");
++ println!("cargo:rerun-if-changed=src/aros.c");
++ println!("cargo:rerun-if-changed={sdk}");
++ for key in ["AROS_GCC","AROS_AR","AROS_SDK","EZA_LIMPET_SDK"] {println!("cargo:rerun-if-env-changed={key}");}
++}
+diff --git a/src/aros.c b/src/aros.c
+new file mode 100644
+index 0000000..77f628a
+--- /dev/null
++++ b/src/aros.c
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: EUPL-1.2 */
++#include <stddef.h>
++#include <limpet/limpet.h>
++#include <proto/dos.h>
++_Static_assert(sizeof(LimpetPresentation)==36,"presentation layout");
++int eza_query(LimpetPresentation *p) { LONG error=0; return limpet_query_presentation(Output(),p,&error); }
++
++#include <exec/tasks.h>
++#include <dos/dos.h>
++#include <proto/exec.h>
++int eza_break(void) { return (SetSignal(0,0)&SIGBREAKF_CTRL_C)!=0; }
++int eza_protection(const char *path, unsigned int *bits) {
++ BPTR lock=Lock(path,ACCESS_READ); if (!lock) return 0;
++ struct FileInfoBlock *fib=AllocDosObject(DOS_FIB,0); int ok=0;
++ if(fib){if(Examine(lock,fib)){*bits=(unsigned int)fib->fib_Protection;ok=1;}FreeDosObject(DOS_FIB,fib);}UnLock(lock);return ok;
++}
+diff --git a/src/aros.rs b/src/aros.rs
+new file mode 100644
+index 0000000..c474549
+--- /dev/null
++++ b/src/aros.rs
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: EUPL-1.2
++use crate::aros_policy::{Presentation,rich_width};
++use std::sync::OnceLock;
++#[link(name="ezaaros",kind="static")]
++unsafe extern "C" { fn eza_query(p:*mut Presentation)->i32; fn eza_break()->i32; fn eza_protection(path:*const std::ffi::c_char,bits:*mut u32)->i32; }
++static WIDTH:OnceLock<Option<usize>>=OnceLock::new();
++pub fn width()->Option<usize>{*WIDTH.get_or_init(||{let mut p=Presentation::default();let status=unsafe{eza_query(&mut p)};rich_width(status,p)})}
++pub fn initialize(){
++ use std::io::IsTerminal;
++ if std::io::stdout().is_terminal() && width().is_none(){
++  eprintln!("eza: This console does not provide the required colour and size capabilities. Run eza in Limpet or another compatible console.");std::process::exit(5);
++ }
++
++}
++
++pub fn interrupted(){if unsafe{eza_break()}!=0 {
++ use std::io::{IsTerminal,Write};
++ if std::io::stdout().is_terminal() && width().is_some(){let _=std::io::stdout().write_all(b"\x1b[0m\n");}
++ eprintln!("eza: Interrupted");std::process::exit(5);
++}}
++pub fn native_protection(path:&std::path::Path)->Option<u32>{
++ use std::os::unix::ffi::OsStrExt;
++ let path=std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;let mut bits=0;
++ if unsafe{eza_protection(path.as_ptr(),&mut bits)}!=0 {Some(bits)}else{None}
++}
++
++pub fn writer()->crate::aros_policy::Output<std::io::Stdout>{
++ use std::io::IsTerminal;
++ let mut p=Presentation::default();let rich=std::io::stdout().is_terminal();
++ if rich {unsafe{eza_query(&mut p)};}
++ crate::aros_policy::Output::new(std::io::stdout(),rich,p.colors==3)
++}
+diff --git a/src/aros_policy.rs b/src/aros_policy.rs
+new file mode 100644
+index 0000000..14bfa51
+--- /dev/null
++++ b/src/aros_policy.rs
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: EUPL-1.2
++#[derive(Default, Debug, Clone, Copy)]
++#[repr(C)]
++pub struct Presentation { pub known:u32, pub colors:u32, pub styles:u32, pub lines:u32, pub rows:u32, pub columns:u32, pub interpretation:u32, pub input:u32, pub features:u32 }
++pub fn rich_width(status:i32, p:Presentation)->Option<usize>{
++ if status == 0 && p.known & 9 == 9 && (2..=3).contains(&p.colors) && p.rows > 0 && p.columns > 0 {Some(p.columns as usize)} else {None}
++}
++#[cfg(test)] mod tests {
++ use super::*;
++ fn compatible()->Presentation { Presentation {known:9, colors:2, rows:24, columns:80,..Default::default()} }
++ #[test] fn accepts_any_console_with_contract(){assert_eq!(rich_width(0,compatible()),Some(80));}
++ #[test] fn ignores_unknown_bits(){let mut p=compatible();p.known|=1<<31;assert_eq!(rich_width(0,p),Some(80));}
++ #[test] fn refuses_unknown_absent_or_invalid(){for p in [Presentation::default(),Presentation{known:1,..compatible()},Presentation{rows:0,..compatible()},Presentation{colors:1,..compatible()},Presentation{colors:99,..compatible()}]{assert_eq!(rich_width(0,p),None);}assert_eq!(rich_width(1,compatible()),None);}
++}
++
++pub fn sgr(params:&str,rgb:bool)->String{
++ let parts:Vec<u32>=params.split(';').map(|v|v.parse().unwrap_or(0)).collect();
++ let mut out=Vec::new();let mut i=0;
++ while i<parts.len(){let v=parts[i];
++  if (v==38||v==48)&&i+2<parts.len()&&parts[i+1]==5 {out.extend(parts[i..i+3].iter().map(u32::to_string));i+=3;continue;}
++  if (v==38||v==48)&&i+4<parts.len()&&parts[i+1]==2 {
++   if rgb {out.extend(parts[i..i+5].iter().map(u32::to_string));}
++   else {let q=|x:u32|(x.min(255)*5+127)/255;let n=16+36*q(parts[i+2])+6*q(parts[i+3])+q(parts[i+4]);out.extend([v.to_string(),"5".into(),n.to_string()]);}i+=5;continue;
++  }
++  let pair=match v{30..=37=>Some((38,v-30)),40..=47=>Some((48,v-40)),90..=97=>Some((38,v-90+8)),100..=107=>Some((48,v-100+8)),_=>None};
++  if let Some((kind,n))=pair{out.extend([kind.to_string(),"5".into(),n.to_string()]);}else{out.push(v.to_string());}i+=1;
++ }out.join(";")
++}
++pub fn protection(bits:u32)->String{
++ "hsparwed".chars().enumerate().map(|(i,c)|{let set=bits&(1<<(7-i))!=0;if set==(i<4){c}else{'-'}}).collect()
++}
++#[cfg(test)] mod more_tests {
++ use super::*;
++ #[test] fn maps_amiga_pens_without_rewriting_index_arguments(){assert_eq!(sgr("1;34;48;5;31",false),"1;38;5;4;48;5;31");assert_eq!(sgr("91;104",true),"38;5;9;48;5;12");}
++ #[test] fn reduces_rgb_only_when_unconfirmed(){assert_eq!(sgr("38;2;255;0;0",false),"38;5;196");assert_eq!(sgr("38;2;255;0;0",true),"38;2;255;0;0");}
++ #[test] fn displays_native_protection_in_dos_order(){assert_eq!(protection(0),"----rwed");assert_eq!(protection(0xff),"hspa----");assert_eq!(protection(8),"-----wed");}
++}
++
++pub struct Output<W:std::io::Write>{pub inner:W,pub rich:bool,pub rgb:bool,pending:Vec<u8>}
++impl<W:std::io::Write> Output<W>{pub fn new(inner:W,rich:bool,rgb:bool)->Self{Self{inner,rich,rgb,pending:Vec::new()}}}
++impl<W:std::io::Write> std::io::Write for Output<W>{
++ fn write(&mut self,bytes:&[u8])->std::io::Result<usize>{
++ #[cfg(target_os="aros")] crate::aros::interrupted();
++ let mut output=Vec::with_capacity(bytes.len());
++ for &b in bytes {
++  if self.pending.is_empty(){if b==27 {self.pending.push(b);}else{output.push(b);}continue;}
++  self.pending.push(b);
++  if self.pending.len()==2 && b!=b'[' {self.pending.clear();continue;}
++  if self.pending.len()>2 && (0x40..=0x7e).contains(&b){
++   if b==b'm' && self.rich {let params=std::str::from_utf8(&self.pending[2..self.pending.len()-1]).unwrap_or("");output.extend_from_slice(format!("\x1b[{}m",sgr(params,self.rgb)).as_bytes());}
++   self.pending.clear();
++  }else if self.pending.len()>256 {self.pending.clear();}
++ }
++ self.inner.write_all(&output)?;Ok(bytes.len())
++}
++ fn flush(&mut self)->std::io::Result<()>{self.inner.flush()}
++}
++#[cfg(test)] mod writer_tests{
++ use super::*;use std::io::Write;
++ #[test]fn split_sequences_map_and_plain_strips(){for rich in [false,true]{let mut w=Output::new(Vec::new(),rich,false);for chunk in [b"\x1b[3".as_slice(),b"4mname\x1b[0m\n"]{w.write_all(chunk).unwrap();}assert_eq!(w.inner,if rich{b"\x1b[38;5;4mname\x1b[0m\n".to_vec()}else{b"name\n".to_vec()});}}
++}
++
++pub fn filename(bytes:&[u8])->String {
++ if bytes.ends_with(b"//") {return String::from_utf8_lossy(bytes).into_owned();}
++ let bytes=if bytes.len()>1 && bytes.ends_with(b"/") {&bytes[..bytes.len()-1]}else{bytes};
++ let end=bytes.len();let mut start=bytes.iter().rposition(|b| *b==b'/' || *b==b':').map_or(0,|i|i+1);
++ if start==end {start=0;}
++ let mut input=&bytes[start..];let mut out=String::new();
++ while !input.is_empty(){match std::str::from_utf8(input){Ok(text)=>{out.push_str(text);break;},Err(e)=>{
++ let valid=e.valid_up_to();out.push_str(std::str::from_utf8(&input[..valid]).unwrap());
++ let n=e.error_len().unwrap_or(input.len()-valid);for b in &input[valid..valid+n]{out.push_str(&format!("\\x{b:02x}"));}input=&input[valid+n..];
++ }}}out
++}
++#[cfg(test)] mod path_tests {use super::*;
++ #[test]fn amiga_names_and_invalid_bytes_are_preserved(){assert_eq!(filename(b"RAM:folder/file name"),"file name");assert_eq!(filename(b"RAM:one"),"one");assert_eq!(filename(b"SYS:"),"SYS:");assert_eq!(filename(b"a/\xff.bin"),"\\xff.bin");assert_eq!(filename("RAM:zażółć".as_bytes()),"zażółć");}
++}
++
++#[cfg(test)] mod trailing_tests {use super::*;
++ #[test]fn directory_separator_and_parent_references(){assert_eq!(filename(b"RAM:a/b/"),"b");assert_eq!(filename(b"RAM:a//"),"RAM:a//");assert_eq!(filename(b"/"),"/");assert_eq!(filename(b"RAM:"),"RAM:");}
++}
+diff --git a/src/fs/dir.rs b/src/fs/dir.rs
+index 70ff56e..321fd43 100644
+--- a/src/fs/dir.rs
++++ b/src/fs/dir.rs
+@@ -49,6 +49,8 @@ impl Dir {
+     /// calls, rather than `read_dir`, to avoid holding multiple open file descriptors
+     /// simultaneously, which can lead to "too many open files" errors.
+     pub fn read(&mut self) -> io::Result<&Self> {
++        #[cfg(target_os = "aros")]
++        crate::aros::interrupted();
+         info!("Reading directory {:?}", &self.path);
+ 
+         self.contents = fs::read_dir(&self.path)?.collect::<Result<Vec<_>, _>>()?;
+@@ -66,6 +68,8 @@ impl Dir {
+     /// entries, so if the user wants to see them, we’ll have to add them
+     /// ourselves after the files have been read.
+     pub fn read_dir(path: PathBuf) -> io::Result<Self> {
++        #[cfg(target_os = "aros")]
++        crate::aros::interrupted();
+         info!("Reading directory {:?}", &path);
+ 
+         let contents = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
+diff --git a/src/fs/fields.rs b/src/fs/fields.rs
+index bb2e182..651c85e 100644
+--- a/src/fs/fields.rs
++++ b/src/fs/fields.rs
+@@ -71,6 +71,8 @@ impl Type {
+ #[rustfmt::skip]
+ #[cfg(unix)]
+ pub struct Permissions {
++    #[cfg(target_os = "aros")]
++    pub protection: Option<u32>,
+     pub user_read:      bool,
+     pub user_write:     bool,
+     pub user_execute:   bool,
+diff --git a/src/fs/file.rs b/src/fs/file.rs
+index 0760bd3..c53282e 100644
+--- a/src/fs/file.rs
++++ b/src/fs/file.rs
+@@ -224,6 +224,9 @@ impl<'dir> File<'dir> {
+     /// use the last component as the name.
+     #[must_use]
+     pub fn filename(path: &Path) -> String {
++        #[cfg(target_os = "aros")]
++        { use std::os::unix::ffi::OsStrExt; return crate::aros_policy::filename(path.as_os_str().as_bytes()); }
++        #[cfg(not(target_os = "aros"))]
+         if let Some(back) = path.components().next_back() {
+             back.as_os_str().to_string_lossy().to_string()
+         } else {
+@@ -619,6 +622,10 @@ impl<'dir> File<'dir> {
+             self.recursive_size
+                 .map_or(f::Size::None, |bytes, _| f::Size::Some(bytes))
+         } else if self.is_char_device() || self.is_block_device() {
++            #[cfg(target_os = "aros")]
++            { f::Size::None }
++            #[cfg(not(target_os = "aros"))]
++            {
+             let device_id = self.metadata().map_or(0, MetadataExt::rdev);
+ 
+             // MacOS and Linux have different arguments and return types for the
+@@ -640,6 +647,7 @@ impl<'dir> File<'dir> {
+                     minor: unsafe { libc::minor(device_id) as u32 },
+                 })
+             }
++            }
+         } else if self.is_file() {
+             f::Size::Some(self.metadata().map_or(0, std::fs::Metadata::len))
+         } else {
+@@ -914,6 +922,8 @@ impl<'dir> File<'dir> {
+         let has_bit = |bit| bits & bit == bit;
+ 
+         Some(f::Permissions {
++            #[cfg(target_os = "aros")]
++            protection: crate::aros::native_protection(&self.path),
+             user_read: has_bit(modes::USER_READ),
+             user_write: has_bit(modes::USER_WRITE),
+             user_execute: has_bit(modes::USER_EXECUTE),
+diff --git a/src/lib.rs b/src/lib.rs
+index f9c2cfa..bca8103 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,3 +18,8 @@ pub mod options;
+ pub mod output;
+ #[allow(unused)]
+ pub mod theme;
++
++#[cfg(target_os = "aros")]
++mod aros;
++#[cfg(target_os = "aros")]
++mod aros_policy;
+diff --git a/src/loc/mod.rs b/src/loc/mod.rs
+index 46b4bdc..17761bc 100644
+--- a/src/loc/mod.rs
++++ b/src/loc/mod.rs
+@@ -27,6 +27,7 @@ use std::ops::AddAssign;
+ use std::path::{Path, PathBuf};
+ 
+ use phf::{Map, phf_map};
++#[cfg(not(target_os = "aros"))]
+ use rayon::prelude::*;
+ 
+ /// A programming language eza knows how to count, along with the comment
+@@ -269,8 +270,11 @@ where
+         collect_jobs(root, is_ignored, &mut jobs);
+     }
+ 
+-    let counted: Vec<(&'static Language, LocCounts, &PathBuf)> = jobs
+-        .par_iter()
++    #[cfg(target_os = "aros")]
++    let input = jobs.iter();
++    #[cfg(not(target_os = "aros"))]
++    let input = jobs.par_iter();
++    let counted: Vec<(&'static Language, LocCounts, &PathBuf)> = input
+         .filter_map(|(path, lang)| {
+             LocCounts::from_path(path, lang)
+                 .ok()
+diff --git a/src/main.rs b/src/main.rs
+index 0620988..d988fa7 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -27,6 +27,10 @@ use crate::output::{Mode, View, code, details, escape, file_name, grid, grid_det
+ use crate::theme::Theme;
+ use log::*;
+ 
++#[cfg(target_os = "aros")]
++mod aros;
++#[cfg(target_os = "aros")]
++mod aros_policy;
+ mod fs;
+ mod info;
+ mod loc;
+@@ -43,8 +47,13 @@ fn main() {
+ 
+     logger::configure(env::var_os(vars::EZA_DEBUG).or_else(|| env::var_os(vars::EXA_DEBUG)));
+ 
++    #[cfg(not(target_os = "aros"))]
+     let cli = get_command().get_matches();
++    #[cfg(target_os = "aros")]
++    let cli = get_command().color(clap::ColorChoice::Never).get_matches();
+ 
++    #[cfg(target_os = "aros")]
++    aros::initialize();
+     let stdout_istty = io::stdout().is_terminal();
+     let mut input = String::new();
+     let mut input_paths: Vec<&OsStr> = match cli.get_many("FILE") {
+@@ -52,7 +61,15 @@ fn main() {
+         None => vec![],
+     };
+     match Options::deduce(&cli, &LiveVars) {
+-        Ok(options) => {
++        Ok(mut options) => {
++            #[cfg(target_os = "aros")]
++            {
++                if !stdout_istty { options.theme.use_colours = crate::theme::UseColours::Never; }
++                options.view.file_style.show_icons = crate::output::file_name::ShowIcons::Never;
++                options.view.file_style.embed_hyperlinks = crate::output::file_name::EmbedHyperlinks::Never;
++                if cli.get_one::<options::parser::ShowWhen>("icons").is_some_and(|v| !matches!(v, options::parser::ShowWhen::Never)) { eprintln!("eza: icons are not supported on this AROS build"); exit(5); }
++                if cli.get_one::<options::parser::ShowWhen>("hyperlink").is_some_and(|v| !matches!(v, options::parser::ShowWhen::Never)) { eprintln!("eza: hyperlinks are not supported on this AROS build"); exit(5); }
++            }
+             if input_paths.is_empty() {
+                 match &options.stdin {
+                     FilesInput::Args => {
+@@ -74,7 +91,10 @@ fn main() {
+             }
+ 
+             let git = git_options(&options, &input_paths);
++            #[cfg(not(target_os = "aros"))]
+             let writer = io::stdout();
++            #[cfg(target_os = "aros")]
++            let writer = aros::writer();
+             let git_repos = git_repos(&options, &input_paths);
+ 
+             let console_width = options.view.width.actual_terminal_width();
+@@ -121,7 +141,10 @@ pub struct Exa<'args> {
+     pub options: Options,
+ 
+     /// The output handle that we write to.
++    #[cfg(not(target_os = "aros"))]
+     pub writer: io::Stdout,
++    #[cfg(target_os = "aros")]
++    pub writer: aros_policy::Output<io::Stdout>,
+ 
+     /// List of the free command-line arguments that should correspond to file
+     /// names (anything that isn’t an option).
+diff --git a/src/output/details.rs b/src/output/details.rs
+index 9a3f9ae..ca14b60 100644
+--- a/src/output/details.rs
++++ b/src/output/details.rs
+@@ -70,6 +70,7 @@ use std::path::PathBuf;
+ use std::vec::IntoIter as VecIntoIter;
+ 
+ use nu_ansi_term::Style;
++#[cfg(not(target_os = "aros"))]
+ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+ 
+ use log::{debug, trace};
+@@ -275,8 +276,11 @@ impl<'a> Render<'a> {
+     ) {
+         use crate::fs::feature::xattr;
+ 
+-        let mut file_eggs: Vec<_> = src
+-            .par_iter()
++        #[cfg(target_os = "aros")]
++        let input = src.iter();
++        #[cfg(not(target_os = "aros"))]
++        let input = src.par_iter();
++        let mut file_eggs: Vec<_> = input
+             .map(|file| {
+                 let mut errors = Vec::new();
+ 
+diff --git a/src/output/escape.rs b/src/output/escape.rs
+index c3e67f2..c0623a2 100644
+--- a/src/output/escape.rs
++++ b/src/output/escape.rs
+@@ -21,7 +21,7 @@ pub fn escape(
+ 
+     if string
+         .chars()
+-        .all(|c| c >= 0x20 as char && c != 0x7f as char)
++        .all(|c| !c.is_control())
+     {
+         bits.push(good.paint(string));
+     } else {
+@@ -31,7 +31,7 @@ pub fn escape(
+ 
+             // TODO: This allocates way too much,
+             // hence the `all` check above.
+-            if c >= 0x20 as char && c != 0x7f as char {
++            if !c.is_control() {
+                 bits.push(good.paint(c.to_string()));
+             } else {
+                 bits.push(bad.paint(c.escape_default().to_string()));
+diff --git a/src/output/mod.rs b/src/output/mod.rs
+index c3a87eb..0b9d129 100644
+--- a/src/output/mod.rs
++++ b/src/output/mod.rs
+@@ -65,7 +65,9 @@ impl TerminalWidth {
+         // terminal, but we’re only interested in stdout because it’s
+         // where the output goes.
+ 
+-        #[cfg(unix)]
++        #[cfg(target_os = "aros")]
++        let stdout_term_width = crate::aros::width();
++        #[cfg(all(unix, not(target_os = "aros")))]
+         let stdout_term_width =
+             { terminal_size::terminal_size_of(std::io::stdout()).map(|(w, _h)| w.0 as _) };
+         #[cfg(windows)]
+diff --git a/src/output/render/groups_aros.rs b/src/output/render/groups_aros.rs
+new file mode 100644
+index 0000000..73f409e
+--- /dev/null
++++ b/src/output/render/groups_aros.rs
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: EUPL-1.2
++// Unix account data is not established on this target; mark unavailable.
++use nu_ansi_term::Style;
++use crate::{fs::fields as f, output::{cell::TextCell,table::{UserFormat,GroupFormat}}};
++use crate::fs::fields::User;
++pub trait Render { fn render<C:Colours,U>(self,colours:&C,users:&U,user_format:UserFormat,group_format:GroupFormat,file_user:Option<User>)->TextCell; }
++impl Render for Option<f::Group> { fn render<C:Colours,U>(self,colours:&C,_users:&U,_user_format:UserFormat,_group_format:GroupFormat,_file_user:Option<User>)->TextCell { TextCell::paint(colours.no_group(), "?".to_string()) } }
++#[allow(dead_code)]
++pub trait Colours {
++    fn yours(&self) -> Style;
++    fn not_yours(&self) -> Style;
++    fn no_group(&self) -> Style;
++    fn root_group(&self) -> Style;
++}
++
+diff --git a/src/output/render/mod.rs b/src/output/render/mod.rs
+index 0e47834..e4ea61b 100644
+--- a/src/output/render/mod.rs
++++ b/src/output/render/mod.rs
+@@ -17,6 +17,7 @@ pub use self::git::Colours as GitColours;
+ pub use self::git::RepoColours as GitRepoColours;
+ 
+ #[cfg(unix)]
++#[cfg_attr(target_os = "aros", path = "groups_aros.rs")]
+ mod groups;
+ #[cfg(unix)]
+ pub use self::groups::{Colours as GroupColours, Render as GroupRender};
+@@ -31,6 +32,7 @@ pub use self::links::Colours as LinksColours;
+ mod permissions;
+ pub use self::permissions::{Colours as PermissionsColours, PermissionsPlusRender};
+ #[cfg(unix)]
++#[cfg_attr(target_os = "aros", path = "permissions_aros.rs")]
+ mod permissions_unix;
+ #[cfg(windows)]
+ mod permissions_windows;
+@@ -43,6 +45,7 @@ pub use self::times::Render as TimeRender;
+ // times does too
+ 
+ #[cfg(unix)]
++#[cfg_attr(target_os = "aros", path = "users_aros.rs")]
+ mod users;
+ #[cfg(unix)]
+ pub use self::users::Colours as UserColours;
+diff --git a/src/output/render/permissions_aros.rs b/src/output/render/permissions_aros.rs
+new file mode 100644
+index 0000000..ce3ca33
+--- /dev/null
++++ b/src/output/render/permissions_aros.rs
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: EUPL-1.2
++use super::{PermissionsColours, PermissionsPlusRender,FiletypeColours};
++use crate::{fs::fields as f,output::cell::TextCell};
++impl PermissionsPlusRender for Option<f::PermissionsPlus> {
++ fn render<C:PermissionsColours+FiletypeColours>(&self,colours:&C)->TextCell {
++  let text=self.as_ref().and_then(|p|p.permissions.protection).map(crate::aros_policy::protection).unwrap_or_else(||"????????".into());
++  TextCell::paint(colours.user_read(),text)
++ }
++}
+diff --git a/src/output/render/users_aros.rs b/src/output/render/users_aros.rs
+new file mode 100644
+index 0000000..3a481e4
+--- /dev/null
++++ b/src/output/render/users_aros.rs
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: EUPL-1.2
++// Unix account data is not established on this target; mark unavailable.
++use nu_ansi_term::Style;
++use crate::{fs::fields as f, output::{cell::TextCell,table::UserFormat}};
++pub trait Render { fn render<C:Colours,U>(self,colours:&C,users:&U,format:UserFormat)->TextCell; }
++impl Render for Option<f::User> { fn render<C:Colours,U>(self,colours:&C,_users:&U,_format:UserFormat)->TextCell { TextCell::paint(colours.no_user(), "?".to_string()) } }
++#[allow(dead_code)]
++pub trait Colours {
++    fn you(&self) -> Style;
++    fn other(&self) -> Style;
++    fn root(&self) -> Style;
++    fn no_user(&self) -> Style;
++}
++
+diff --git a/src/output/table.rs b/src/output/table.rs
+index 7b5c25a..af4d46f 100644
+--- a/src/output/table.rs
++++ b/src/output/table.rs
+@@ -14,7 +14,13 @@ use chrono::prelude::*;
+ use log::debug;
+ use std::sync::LazyLock;
+ #[cfg(unix)]
++#[cfg(not(target_os = "aros"))]
+ use uzers::UsersCache;
++#[cfg(target_os = "aros")]
++#[derive(Default)]
++pub struct UsersCache;
++#[cfg(target_os = "aros")]
++impl UsersCache { fn new()->Self {Self} }
+ 
+ use crate::fs::feature::git::GitCache;
+ use crate::fs::{File, fields as f};

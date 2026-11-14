@@ -1,0 +1,117 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] Do not retain directory streams for listed entries
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001-aros-platform.patch 0002-directory-errors-exit-status.patch
+Upstream-Status: candidate (all platforms)
+Scope: src/fs/dir.rs only; listing order, filtering and file types unchanged.
+
+Dir kept every std::fs::DirEntry. On Unix-like std each DirEntry holds an Arc
+to its directory stream, so a tree keeps one open descriptor per directory
+that has been read until the whole Dir tree is dropped. With a small
+descriptor table this ends in EMFILE on Unix and, on AROS ABIv11 crt.library,
+in a crash inside __setfdesc when the table is full (eza -Tl -L2 over the
+packaged LICENSES drawer). Keep only the path and the file type that was
+already being read from the entry; the stream is closed when read_entries
+returns.
+
+Verification: tests/tree_fd_regression.py failed under a 64-descriptor limit
+before the change and passes after it (160 sibling directories, depth 72).
+Native AROS results are recorded in the port's validation documents.
+Removal: drop if upstream stops retaining DirEntry values.
+
+diff --git a/src/fs/dir.rs b/src/fs/dir.rs
+index 321fd43..f59b079 100644
+--- a/src/fs/dir.rs
++++ b/src/fs/dir.rs
+@@ -7,7 +7,6 @@
+ use crate::fs::feature::git::GitCache;
+ use crate::fs::fields::GitStatus;
+ use std::fs;
+-use std::fs::DirEntry;
+ use std::io;
+ use std::path::{Path, PathBuf};
+ use std::slice::Iter as SliceIter;
+@@ -24,12 +23,26 @@ use crate::fs::File;
+ /// accordingly. (See `File#get_source_files`)
+ pub struct Dir {
+     /// A vector of the files that have been read from this directory.
+-    contents: Vec<DirEntry>,
++    contents: Vec<CachedEntry>,
+ 
+     /// The path that was read.
+     pub path: PathBuf,
+ }
+ 
++// Own only values needed for display. std::fs::DirEntry retains its directory
++// stream on Unix; retaining one per child can exhaust small system FD tables.
++struct CachedEntry {
++    path: PathBuf,
++    file_type: Option<fs::FileType>,
++}
++
++fn read_entries(path: &Path) -> io::Result<Vec<CachedEntry>> {
++    fs::read_dir(path)?.map(|entry| {
++        let entry = entry?;
++        Ok(CachedEntry { path: entry.path(), file_type: entry.file_type().ok() })
++    }).collect()
++}
++
+ impl Dir {
+     /// Create a new, empty `Dir` object representing the directory at the given path.
+     ///
+@@ -53,7 +66,7 @@ impl Dir {
+         crate::aros::interrupted();
+         info!("Reading directory {:?}", &self.path);
+ 
+-        self.contents = fs::read_dir(&self.path)?.collect::<Result<Vec<_>, _>>()?;
++        self.contents = read_entries(&self.path)?;
+ 
+         info!("Read directory success {:?}", &self.path);
+         Ok(self)
+@@ -72,7 +85,7 @@ impl Dir {
+         crate::aros::interrupted();
+         info!("Reading directory {:?}", &path);
+ 
+-        let contents = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
++        let contents = read_entries(&path)?;
+ 
+         info!("Read directory success {:?}", &path);
+         Ok(Self { contents, path })
+@@ -104,7 +117,7 @@ impl Dir {
+     /// Whether this directory contains a file with the given path.
+     #[must_use]
+     pub fn contains(&self, path: &Path) -> bool {
+-        self.contents.iter().any(|p| p.path().as_path() == path)
++        self.contents.iter().any(|p| p.path.as_path() == path)
+     }
+ 
+     /// Append a path onto the path specified by this directory.
+@@ -118,7 +131,7 @@ impl Dir {
+ #[allow(clippy::struct_excessive_bools)]
+ pub struct Files<'dir, 'ig> {
+     /// The internal iterator over the paths that have been read already.
+-    inner: SliceIter<'dir, DirEntry>,
++    inner: SliceIter<'dir, CachedEntry>,
+ 
+     /// The directory that begat those paths.
+     dir: &'dir Dir,
+@@ -156,7 +169,7 @@ impl<'dir> Files<'dir, '_> {
+     fn next_visible_file(&mut self) -> Option<File<'dir>> {
+         loop {
+             if let Some(entry) = self.inner.next() {
+-                let path = entry.path();
++                let path = entry.path.clone();
+                 let filename = File::filename(&path);
+                 if !self.dotfiles && filename.starts_with('.') {
+                     continue;
+@@ -182,7 +195,7 @@ impl<'dir> Files<'dir, '_> {
+                     filename,
+                     self.deref_links,
+                     self.total_size,
+-                    entry.file_type().ok(),
++                    entry.file_type,
+                 );
+ 
+                 // Windows has its own concept of hidden files, when dotfiles are

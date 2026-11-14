@@ -1,0 +1,4 @@
+FailAt 21
+RAM:ezt/acceptance rich
+Echo $RC >RESULTS:ez3-rich-b2d5e8.rc
+Echo RICH-DONE >RESULTS:ez3-rich-done-b2d5e8.txt

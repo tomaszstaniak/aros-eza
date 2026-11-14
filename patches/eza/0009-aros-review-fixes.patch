@@ -1,0 +1,169 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] AROS: current-directory operand, panics, Git memory, filter fixes
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001 0002 0003 0004 0005 0006 0007 0008
+Upstream-Status: AROS-specific, not for upstream
+Scope: target_os = "aros" only, plus host-tested helpers in src/aros_policy.rs.
+
+- An operand of "." (also the default with no operand) is replaced by the
+  current directory's name. AmigaDOS has no "." entry and the C library does
+  not translate it: a plain `eza -l` failed with "\".\": No such file or
+  directory" (pool v11-1, 2026-10-21, candidate 7).
+- A panic hook reports the panic and leaves through aros::exit: with
+  panic=abort, abort() on the 0007 stack fails as exit() would.
+- libgit2 pack windows are limited to 1 MiB each and 32 MiB in total:
+  without mmap each window is read into memory, and the 64-bit defaults are
+  1 GiB and 8 GiB.
+- Ctrl-C also closes an open OSC 8 link before the colour reset.
+- writer() passes the query status to rich_width instead of 0.
+- A truncated 38/48 colour no longer turns its "5" into blink, and ESC ESC
+  starts one sequence instead of printing the second introducer's text.
+
+Verification: host test review_filter_tests; native results in the port's
+validation documents. Found by independent review and native testing.
+Removal: with the AROS presentation patches.
+
+diff --git a/src/aros.rs b/src/aros.rs
+index e10c84c..c3dfa66 100644
+--- a/src/aros.rs
++++ b/src/aros.rs
+@@ -32,7 +32,10 @@ pub fn interrupted() {
+     if unsafe { eza_break() } != 0 {
+         use std::io::{IsTerminal, Write};
+         if std::io::stdout().is_terminal() && width().is_some() {
+-            let _ = std::io::stdout().write_all(b"\x1b[0m\n");
++            // A row can be cut between a link's opening and closing OSC 8;
++            // close it too, or the console keeps linking later Shell text.
++            let reset: &[u8] = if hyperlinks() { b"\x1b]8;;\x1b\\\x1b[0m\n" } else { b"\x1b[0m\n" };
++            let _ = std::io::stdout().write_all(reset);
+         }
+         eprintln!("eza: Interrupted");
+         exit(5);
+@@ -52,13 +55,14 @@ pub fn native_protection(path: &std::path::Path) -> Option<u32> {
+ pub fn writer() -> crate::aros_policy::Output<std::io::Stdout> {
+     use std::io::IsTerminal;
+     let mut p = Presentation::default();
++    let mut status = 1;
+     let rich = std::io::stdout().is_terminal();
+     if rich {
+-        unsafe { eza_query(&mut p) };
++        status = unsafe { eza_query(&mut p) };
+     }
+     crate::aros_policy::Output::new(
+         std::io::stdout(),
+-        rich && rich_width(0, p).is_some(),
++        rich && rich_width(status, p).is_some(),
+         p.colors == 3,
+     )
+     .capabilities(p)
+@@ -103,6 +107,19 @@ pub fn run(main: fn()) -> ! {
+         (MAIN.get().expect("entry set before the swap"))();
+     }
+     MAIN.set(main).expect("run is called once");
++    // panic=abort would abort() on the swapped stack, which fails like
++    // exit() there; report the panic and leave through eza_leave instead.
++    std::panic::set_hook(Box::new(|info| {
++        eprintln!("eza: {info}");
++        exit(101)
++    }));
++    // Without mmap libgit2 reads each pack window into memory, and the
++    // 64-bit defaults allow 1 GiB windows up to 8 GiB in total.
++    #[cfg(feature = "git")]
++    unsafe {
++        let _ = git2::opts::set_mwindow_size(1024 * 1024);
++        let _ = git2::opts::set_mwindow_mapped_limit(32 * 1024 * 1024);
++    }
+     let code = unsafe { eza_run_with_stack(entry) };
+     std::process::exit(code)
+ }
+@@ -113,3 +130,8 @@ pub fn exit(code: i32) -> ! {
+     unsafe { eza_leave(code) };
+     std::process::exit(code)
+ }
++
++/// The current directory by name, for operands that say ".".
++pub fn current_dir_name() -> std::ffi::OsString {
++    std::env::current_dir().map_or_else(|_| ".".into(), std::path::PathBuf::into_os_string)
++}
+diff --git a/src/aros_policy.rs b/src/aros_policy.rs
+index 6e5af44..a8b2029 100644
+--- a/src/aros_policy.rs
++++ b/src/aros_policy.rs
+@@ -183,13 +183,15 @@ impl<W: std::io::Write> Output<W> {
+                         let mut i = 0;
+                         while i < parts.len() {
+                             let v = parts[i].parse::<u32>().unwrap_or(0);
+-                            if (v == 38 || v == 48) && i + 2 < parts.len() {
+-                                let n = if parts[i + 1] == "2" { 5 } else { 3 };
++                            if v == 38 || v == 48 {
++                                let n = if parts.get(i + 1) == Some(&"2") { 5 } else { 3 };
+                                 if i + n <= parts.len() {
+                                     kept.extend_from_slice(&parts[i..i + n]);
+                                     i += n;
+                                     continue;
+                                 }
++                                // Truncated colour: its "5" must not become blink.
++                                break;
+                             }
+                             let allowed = match v {
+                                 0 | 39 | 49 => true,
+@@ -244,6 +246,11 @@ impl<W: std::io::Write> std::io::Write for Output<W> {
+             }
+             match self.state {
+                 1 => match b {
++                    // ESC ESC: the second one starts the sequence.
++                    27 => {
++                        self.pending.clear();
++                        self.pending.push(b);
++                    }
+                     b'[' => self.state = 2,
+                     b']' => self.state = 3,
+                     b'P' | b'X' | b'^' | b'_' => self.state = 5,
+@@ -500,3 +507,16 @@ mod whole_path_tests {
+         assert_eq!(filename(b"RAM:a/b//"), "RAM:a/b//");
+     }
+ }
++
++#[cfg(test)]
++mod review_filter_tests {
++    use super::*;
++    use std::io::Write;
++    #[test]
++    fn truncated_colour_is_not_blink_and_double_escape_starts_once() {
++        let p = Presentation { known: 2, styles: 16, ..Default::default() };
++        let mut w = Output::new(Vec::new(), true, false).capabilities(p);
++        w.write_all(b"\x1b[1;38;5mA\x1b\x1b[31mB").unwrap();
++        assert_eq!(w.inner, b"A\x1b[38;5;1mB");
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index a57739f..f60c0be 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -77,6 +77,10 @@ fn eza_main() {
+     aros::initialize();
+     let stdout_istty = io::stdout().is_terminal();
+     let mut input = String::new();
++    // AmigaDOS has no "." entry and the C library does not translate it:
++    // a plain `eza` failed with "\".\": No such file or directory".
++    #[cfg(target_os = "aros")]
++    let aros_cwd = aros::current_dir_name();
+     let mut input_paths: Vec<&OsStr> = match cli.get_many("FILE") {
+         Some(x) => x.map(OsString::as_os_str).collect(),
+         None => vec![],
+@@ -107,6 +111,13 @@ fn eza_main() {
+                 }
+             }
+ 
++            #[cfg(target_os = "aros")]
++            for path in &mut input_paths {
++                if *path == OsStr::new(".") {
++                    *path = aros_cwd.as_os_str();
++                }
++            }
++
+             let git = git_options(&options, &input_paths);
+             #[cfg(not(target_os = "aros"))]
+             let writer = io::stdout();

@@ -1,0 +1,160 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] Return failure when directory enumeration fails
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001-aros-platform.patch
+Upstream-Status: candidate
+Scope: all platforms; preserves eza's existing runtime/permission error codes.
+
+A directory can have readable metadata but fail enumeration. print_dirs logged
+that failure while returning success, including on an AROS exclusive DOS lock.
+Carry the error status through this directory, recursive calls and tree-rendered
+child errors, preserving
+an earlier nonzero status. No upstream submission has been made.
+
+Verification: host regression observed return0 instead of runtime error1 before
+fix; the regression and full no-Git host suite are run with this patch. Native
+locked-directory validation is required on the final candidate archive.
+Removal: drop once an upstream release includes the same status propagation.
+
+diff --git a/src/main.rs b/src/main.rs
+index d988fa7..3069587 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -336,7 +336,7 @@ impl Exa<'_> {
+         dir_files: Vec<Dir>,
+         mut first: bool,
+         is_only_dir: bool,
+-        exit_status: i32,
++        mut exit_status: i32,
+     ) -> io::Result<i32> {
+         let View {
+             file_style: file_name::Options { quote_style, .. },
+@@ -349,7 +349,9 @@ impl Exa<'_> {
+             let dir = match dir.read() {
+                 Ok(dir) => dir,
+                 Err(e) => {
++                    exit_status = exit_status.max(exits::RUNTIME_ERROR);
+                     if e.kind() == ErrorKind::PermissionDenied {
++                        exit_status = exits::PERMISSION_DENIED;
+                         eprintln!(
+                             "Permission denied: {} - code: {}",
+                             dir.path.display(),
+@@ -424,7 +426,7 @@ impl Exa<'_> {
+ 
+                     self.print_files(Some(dir), children)?;
+                     match self.print_dirs(child_dirs, false, false, exit_status) {
+-                        Ok(_) => (),
++                        Ok(child_status) => exit_status = exit_status.max(child_status),
+                         Err(e) => return Err(e),
+                     }
+                     continue;
+@@ -596,3 +598,32 @@ mod exits {
+     /// Exit code for missing file permissions
+     pub const PERMISSION_DENIED: i32 = 13;
+ }
++
++#[cfg(all(test, not(target_os = "aros")))]
++mod directory_error_tests {
++ use super::*;
++ fn application_for(args:&[&str]) -> Exa<'static> {
++  let cli=get_command().try_get_matches_from(args).unwrap();
++  let options=Options::deduce(&cli,&LiveVars).unwrap();let theme=options.theme.to_theme(false);
++  Exa{options,writer:io::stdout(),input_paths:vec![],theme,console_width:None,git:None,git_repos:false}
++ }
++ fn application()->Exa<'static>{application_for(&["eza"])}
++ #[test]fn unreadable_directory_returns_failure(){
++  let path=env::temp_dir().join(format!("eza-absent-{}-{:?}",std::process::id(),std::time::SystemTime::now()));
++  let result=application().print_dirs(vec![Dir::new(path)],true,true,0).unwrap();
++  assert_eq!(result,exits::RUNTIME_ERROR);
++ }
++ #[test]fn directory_error_preserves_prior_failure(){
++  let path=env::temp_dir().join(format!("eza-absent-{}-{:?}",std::process::id(),std::time::SystemTime::now()));
++  assert_eq!(application().print_dirs(vec![Dir::new(path)],true,true,2).unwrap(),2);
++ }
++ #[test]fn tree_child_enumeration_error_returns_failure(){
++  let path=env::temp_dir().join(format!("eza-removed-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++  std::fs::create_dir(&path).unwrap();
++  let file=File::from_args(path.clone(),None,None,false,false,None);
++  assert!(file.is_directory());
++  std::fs::remove_dir(&path).unwrap();
++  assert!(application_for(&["eza","-T"]).print_files(None,vec![file]).is_err());
++ }
++
++}
+diff --git a/src/output/details.rs b/src/output/details.rs
+index ca14b60..113c7dd 100644
+--- a/src/output/details.rs
++++ b/src/output/details.rs
+@@ -169,6 +169,7 @@ impl<'a> AsRef<File<'a>> for Egg<'a> {
+ impl<'a> Render<'a> {
+     pub fn render<W: Write>(mut self, w: &mut W) -> io::Result<()> {
+         let mut rows = Vec::new();
++        let mut had_errors = false;
+ 
+         let color_scale_info = ColorScaleInformation::from_color_scale(
+             self.opts.color_scale,
+@@ -213,7 +214,7 @@ impl<'a> Render<'a> {
+             // This is weird, but I can’t find a way around it:
+             // https://internals.rust-lang.org/t/should-option-mut-t-implement-copy/3715/6
+             let mut table = Some(table);
+-            self.add_files_to_table(
++            had_errors |= self.add_files_to_table(
+                 &mut table,
+                 &mut rows,
+                 &self.files,
+@@ -225,7 +226,7 @@ impl<'a> Render<'a> {
+                 writeln!(w, "{}", row.strings())?;
+             }
+         } else {
+-            self.add_files_to_table(
++            had_errors |= self.add_files_to_table(
+                 &mut None,
+                 &mut rows,
+                 &self.files,
+@@ -238,7 +239,7 @@ impl<'a> Render<'a> {
+             }
+         }
+ 
+-        Ok(())
++        if had_errors { Err(io::Error::other("One or more directories could not be read")) } else { Ok(()) }
+     }
+ 
+     /// The root path(s) to recurse when computing the `--loc` percentage
+@@ -273,8 +274,9 @@ impl<'a> Render<'a> {
+         src: &[File<'dir>],
+         depth: TreeDepth,
+         color_scale_info: Option<ColorScaleInformation>,
+-    ) {
++    ) -> bool {
+         use crate::fs::feature::xattr;
++        let mut had_errors = false;
+ 
+         #[cfg(target_os = "aros")]
+         let input = src.iter();
+@@ -354,6 +356,7 @@ impl<'a> Render<'a> {
+         for (tree_params, egg) in depth.iterate_over(file_eggs.into_iter()) {
+             let mut files = Vec::new();
+             let errors = egg.errors;
++            had_errors |= !errors.is_empty();
+ 
+             if let (Some(ref mut t), Some(row)) = (table.as_mut(), egg.table_row.as_ref()) {
+                 t.add_widths(row);
+@@ -404,7 +407,7 @@ impl<'a> Render<'a> {
+                         ));
+                     }
+ 
+-                    self.add_files_to_table(table, rows, &files, depth.deeper(), color_scale_info);
++                    had_errors |= self.add_files_to_table(table, rows, &files, depth.deeper(), color_scale_info);
+                     continue;
+                 }
+             }
+@@ -424,6 +427,7 @@ impl<'a> Render<'a> {
+                 rows.push(r);
+             }
+         }
++        had_errors
+     }
+ 
+     #[must_use]

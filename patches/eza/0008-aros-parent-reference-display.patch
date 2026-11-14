@@ -1,0 +1,81 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] AROS: show a parent reference ending in // once
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001 0002 0003 0004 0005 0006 0007
+Upstream-Status: AROS-specific, not for upstream
+Scope: target_os = "aros" display of path arguments; helper tested on host.
+
+0005 keeps a name ending in "//" whole, because in AmigaDOS that suffix
+refers to a parent drawer and has no last component. The renderer still
+added the argument's parent first, so "eza -1d RAM:q/tiny/sub//" printed
+"RAM:q/tiny/RAM:q/tiny/sub//" (pool v11-1, 2026-10-21, candidate 6). Skip
+the parent prefix when the name already is the whole path.
+
+Verification: host test whole_path_tests in src/aros_policy.rs; native
+results are recorded in the port's validation documents.
+Removal: with 0005.
+
+diff --git a/src/aros_policy.rs b/src/aros_policy.rs
+index c179914..6e5af44 100644
+--- a/src/aros_policy.rs
++++ b/src/aros_policy.rs
+@@ -306,8 +306,14 @@ mod writer_tests {
+     }
+ }
+ 
++/// Whether `filename` returns the whole path: a trailing "//" refers to a
++/// parent drawer in AmigaDOS and has no last component of its own.
++pub fn names_whole_path(bytes: &[u8]) -> bool {
++    bytes.ends_with(b"//")
++}
++
+ pub fn filename(bytes: &[u8]) -> String {
+-    let parent = bytes.ends_with(b"//");
++    let parent = names_whole_path(bytes);
+     let bytes = if !parent && bytes.len() > 1 && bytes.ends_with(b"/") {
+         &bytes[..bytes.len() - 1]
+     } else {
+@@ -480,3 +486,17 @@ mod file_uri_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod whole_path_tests {
++    use super::*;
++    #[test]
++    fn only_parent_references_name_the_whole_path() {
++        assert!(names_whole_path(b"RAM:a/b//"));
++        assert!(names_whole_path(b"RAM:\xff//"));
++        for p in [b"RAM:a/b/".as_slice(), b"RAM:a/b", b"RAM:", b"/"] {
++            assert!(!names_whole_path(p));
++        }
++        assert_eq!(filename(b"RAM:a/b//"), "RAM:a/b//");
++    }
++}
+diff --git a/src/output/file_name.rs b/src/output/file_name.rs
+index afa6756..9b769b9 100644
+--- a/src/output/file_name.rs
++++ b/src/output/file_name.rs
+@@ -309,7 +309,18 @@ impl<C: Colours> FileName<'_, '_, C> {
+             bits.push(style.paint(" ".repeat(spaces_count as usize)));
+         }
+ 
+-        if self.file.parent_dir.is_none()
++        // On AROS a name ending in "//" is the whole path already (a parent
++        // reference, see aros_policy::filename); its parent prefix would be
++        // printed twice.
++        #[cfg(target_os = "aros")]
++        let whole_path = {
++            use std::os::unix::ffi::OsStrExt;
++            crate::aros_policy::names_whole_path(self.file.path.as_os_str().as_bytes())
++        };
++        #[cfg(not(target_os = "aros"))]
++        let whole_path = false;
++        if !whole_path
++            && self.file.parent_dir.is_none()
+             && self.options.absolute == Absolute::Off
+             && let Some(parent) = self.file.path.parent()
+         {

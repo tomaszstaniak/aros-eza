@@ -1,0 +1,172 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] AROS: run on a 1 MiB stack of eza's own
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001 0002 0003 0004 0005 0006
+Upstream-Status: AROS-specific, not for upstream
+Scope: target_os = "aros" only (src/aros.c, src/aros.rs, src/main.rs).
+
+A Shell on AROS One gives a program 40960 bytes of stack. With output
+redirected from such a Shell, eza -T over 72 nested drawers stopped with
+"Stack extends out of range" (pool v11-1, 2026-10-21); every earlier native
+test ran with 256 KiB (Limpet's Shell) or 1 MiB (the test runner). The
+ABIv11 runtime has no __stack setting, so main runs through exec's
+NewStackSwap on 1 MiB of its own when the current stack is smaller.
+
+exit() on the swapped stack longjmps to the start-up frame on the original
+stack while the task bounds still describe the new one, so on AROS every
+exit inside eza (its own, aros::initialize/interrupted, and clap's for
+--help, --version and usage errors, now via try_get_matches) returns to the
+swap point first and the process exits from the original stack.
+
+Verification: native results are recorded in the port's validation documents.
+Removal: when the AROS runtime provides a per-program stack size.
+
+diff --git a/src/aros.c b/src/aros.c
+index 37cedd6..d348811 100644
+--- a/src/aros.c
++++ b/src/aros.c
+@@ -20,3 +20,37 @@ int eza_canonical(const char *path, char *out, unsigned int size) {
+  BPTR lock=Lock(path,ACCESS_READ); int ok; if (!lock) return 0;
+  ok=NameFromLock(lock,out,size)!=0; UnLock(lock); return ok;
+ }
++
++/* Run eza on a stack of its own. A Shell on AROS One gives 40960 bytes, and
++ * a 72-level tree overran it ("Stack extends out of range", pool v11-1,
++ * 2026-10-21); the ABIv11 runtime has no __stack mechanism, so swap
++ * explicitly, as arospkg's bigstack.c does. exit() must not run on the
++ * swapped stack: it longjmps to the start-up frame on the original stack
++ * while the task's bounds still describe ours. So every exit inside eza
++ * comes back here through eza_leave, and the caller exits after the swap. */
++#include <exec/memory.h>
++#include <setjmp.h>
++#define EZA_STACK (1024 * 1024)
++static jmp_buf eza_jump;
++static int eza_jump_code, eza_jump_active;
++static IPTR eza_trampoline(IPTR entry)
++{
++ if (setjmp(eza_jump)) { eza_jump_active=0; return (IPTR)eza_jump_code; }
++ eza_jump_active=1; ((void (*)(void))entry)(); eza_jump_active=0; return 0;
++}
++int eza_run_with_stack(void (*entry)(void))
++{
++ struct Task *me=FindTask(NULL);
++ IPTR have=(IPTR)me->tc_SPUpper-(IPTR)me->tc_SPLower,r;
++ struct StackSwapStruct sss; struct StackSwapArgs args; APTR stack;
++ if (have>=EZA_STACK || !(stack=AllocMem(EZA_STACK,MEMF_ANY))) return (int)eza_trampoline((IPTR)entry);
++ sss.stk_Lower=stack; sss.stk_Upper=(APTR)((IPTR)stack+EZA_STACK); sss.stk_Pointer=sss.stk_Upper;
++ args.Args[0]=(IPTR)entry;
++ r=NewStackSwap(&sss,(APTR)eza_trampoline,&args);
++ FreeMem(stack,EZA_STACK); return (int)r;
++}
++int eza_leave(int code)
++{
++ if (!eza_jump_active) return 0;
++ eza_jump_code=code; longjmp(eza_jump,1);
++}
+diff --git a/src/aros.rs b/src/aros.rs
+index 782c562..e10c84c 100644
+--- a/src/aros.rs
++++ b/src/aros.rs
+@@ -7,6 +7,8 @@ unsafe extern "C" {
+     fn eza_break() -> i32;
+     fn eza_protection(path: *const std::ffi::c_char, bits: *mut u32) -> i32;
+     fn eza_canonical(path: *const std::ffi::c_char, out: *mut std::ffi::c_char, size: u32) -> i32;
++    fn eza_run_with_stack(entry: extern "C" fn()) -> i32;
++    fn eza_leave(code: i32) -> i32;
+ }
+ static WIDTH: OnceLock<Option<usize>> = OnceLock::new();
+ pub fn width() -> Option<usize> {
+@@ -22,7 +24,7 @@ pub fn initialize() {
+         eprintln!(
+             "eza: This console does not provide the required colour and size capabilities. Run eza in Limpet or another compatible console."
+         );
+-        std::process::exit(5);
++        exit(5);
+     }
+ }
+ 
+@@ -33,7 +35,7 @@ pub fn interrupted() {
+             let _ = std::io::stdout().write_all(b"\x1b[0m\n");
+         }
+         eprintln!("eza: Interrupted");
+-        std::process::exit(5);
++        exit(5);
+     }
+ }
+ pub fn native_protection(path: &std::path::Path) -> Option<u32> {
+@@ -92,3 +94,22 @@ pub fn canonicalize(path: &std::path::Path) -> Option<std::path::PathBuf> {
+     buf.truncate(end);
+     Some(std::ffi::OsString::from_vec(buf).into())
+ }
++
++/// Run `main` on eza's own 1 MiB stack (see eza_run_with_stack in aros.c)
++/// and exit with its status from the original stack.
++pub fn run(main: fn()) -> ! {
++    static MAIN: OnceLock<fn()> = OnceLock::new();
++    extern "C" fn entry() {
++        (MAIN.get().expect("entry set before the swap"))();
++    }
++    MAIN.set(main).expect("run is called once");
++    let code = unsafe { eza_run_with_stack(entry) };
++    std::process::exit(code)
++}
++
++/// Leave eza with `code`. Inside `run` this returns to the original stack
++/// first; the skipped frames are abandoned exactly as process::exit would.
++pub fn exit(code: i32) -> ! {
++    unsafe { eza_leave(code) };
++    std::process::exit(code)
++}
+diff --git a/src/main.rs b/src/main.rs
+index a65b98a..a57739f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -13,7 +13,10 @@ use std::env;
+ use std::ffi::{OsStr, OsString};
+ use std::io::{self, ErrorKind, IsTerminal, Read, Write, stdin};
+ use std::path::{Component, PathBuf};
++#[cfg(not(target_os = "aros"))]
+ use std::process::exit;
++#[cfg(target_os = "aros")]
++use crate::aros::exit;
+ 
+ use nu_ansi_term::{AnsiStrings as ANSIStrings, Style};
+ use options::parser::get_command;
+@@ -39,7 +42,17 @@ mod options;
+ mod output;
+ mod theme;
+ 
++#[cfg(target_os = "aros")]
+ fn main() {
++    aros::run(eza_main)
++}
++
++#[cfg(not(target_os = "aros"))]
++fn main() {
++    eza_main();
++}
++
++fn eza_main() {
+     #[cfg(unix)]
+     unsafe {
+         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+@@ -49,8 +62,16 @@ fn main() {
+ 
+     #[cfg(not(target_os = "aros"))]
+     let cli = get_command().get_matches();
++    // clap would call std::process::exit itself for --help, --version and
++    // errors; on AROS that must go through aros::exit (see aros::run).
+     #[cfg(target_os = "aros")]
+-    let cli = get_command().color(clap::ColorChoice::Never).get_matches();
++    let cli = get_command()
++        .color(clap::ColorChoice::Never)
++        .try_get_matches()
++        .unwrap_or_else(|e| {
++            let _ = e.print();
++            exit(e.exit_code())
++        });
+ 
+     #[cfg(target_os = "aros")]
+     aros::initialize();

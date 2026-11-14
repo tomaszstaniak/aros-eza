@@ -1,0 +1,272 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] AROS: POSIX dot operands, volume-root names and Git matching
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001-0009
+Upstream-Status: AROS-specific, not for upstream
+Scope: target_os = "aros" only; helpers tested on the host.
+
+Operands: 0009 replaced only ".". An operand is now kept when it exists as
+written (AmigaDOS allows files named "." and ".."); otherwise a POSIX form
+is tried in AmigaDOS terms ("./x" -> "x", "../x" -> "/x", "a/../b" ->
+"a//b", ".." -> "/") and used when that exists. Anything else is kept, so
+error messages name what was typed. "." is still the current drawer.
+
+Names: an operand at a volume root ("RAM:clean.txt") was shown as
+"clean.txt", because Rust's Path sees one component and no parent there.
+The volume part is now printed in the parent-path style.
+
+Git: GitRepo::has_path used Path::starts_with, which compares components,
+and Rust sees "RAM:x" as one component; files listed in a volume root were
+never matched to the repository there, so --git showed nothing and
+--git-ignore kept ignored files. The AROS check compares bytes at a ':' or
+'/' boundary (aros_policy::path_starts_with).
+
+Verification: host tests posix_path_tests and prefix_tests in src/aros_policy.rs; native
+results in the port's validation documents.
+Removal: with the AROS path patches.
+
+diff --git a/src/aros.rs b/src/aros.rs
+index c3dfa66..41cf641 100644
+--- a/src/aros.rs
++++ b/src/aros.rs
+@@ -131,7 +131,23 @@ pub fn exit(code: i32) -> ! {
+     std::process::exit(code)
+ }
+ 
+-/// The current directory by name, for operands that say ".".
+-pub fn current_dir_name() -> std::ffi::OsString {
+-    std::env::current_dir().map_or_else(|_| ".".into(), std::path::PathBuf::into_os_string)
++/// An operand as eza should open it. "." is the current drawer by name
++/// (AmigaDOS has no "." entry and the C library does not translate it). A
++/// path that exists as written is kept, because "." and ".." are legal
++/// AmigaDOS names; otherwise a POSIX form ("./x", "../x", "a/../b") is
++/// translated when the translation exists. Anything else is kept, so that
++/// error messages name what the user typed.
++pub fn operand(path: &std::ffi::OsStr) -> std::ffi::OsString {
++    use std::os::unix::ffi::{OsStrExt, OsStringExt};
++    if path == "." {
++        return std::env::current_dir().map_or_else(|_| path.into(), std::path::PathBuf::into_os_string);
++    }
++    if canonicalize(std::path::Path::new(path)).is_some() {
++        return path.into();
++    }
++    match crate::aros_policy::from_posix(path.as_bytes()) {
++        Some(t) if t.is_empty() => std::env::current_dir().map_or_else(|_| path.into(), std::path::PathBuf::into_os_string),
++        Some(t) if canonicalize(std::path::Path::new(std::ffi::OsStr::from_bytes(&t))).is_some() => std::ffi::OsString::from_vec(t),
++        _ => path.into(),
++    }
+ }
+diff --git a/src/aros_policy.rs b/src/aros_policy.rs
+index a8b2029..2199763 100644
+--- a/src/aros_policy.rs
++++ b/src/aros_policy.rs
+@@ -334,7 +334,12 @@ pub fn filename(bytes: &[u8]) -> String {
+     if parent || start == end {
+         start = 0;
+     }
+-    let mut input = &bytes[start..];
++    escape_bytes(&bytes[start..])
++}
++
++/// Valid UTF-8 as is, every invalid byte as \xNN.
++pub fn escape_bytes(bytes: &[u8]) -> String {
++    let mut input = bytes;
+     let mut out = String::new();
+     while !input.is_empty() {
+         match std::str::from_utf8(input) {
+@@ -520,3 +525,117 @@ mod review_filter_tests {
+         assert_eq!(w.inner, b"A\x1b[38;5;1mB");
+     }
+ }
++
++/// The volume or assign before the name of an operand at a volume root
++/// ("RAM:" for "RAM:clean.txt"). Rust's Path sees a single component there
++/// and no parent, so eza printed the name alone.
++pub fn volume_prefix(bytes: &[u8]) -> Option<String> {
++    if bytes.contains(&b'/') {
++        return None;
++    }
++    let colon = bytes.iter().position(|b| *b == b':')?;
++    (colon + 1 < bytes.len()).then(|| escape_bytes(&bytes[..=colon]))
++}
++
++/// AmigaDOS form of a path written with POSIX "." and ".." components, or
++/// None when it has none. "." components go, ".." becomes a parent step:
++/// "./x" -> "x", "../x" -> "/x", "a/../b" -> "a//b", ".." -> "/". Empty
++/// components already are AmigaDOS parent steps and stay; a volume prefix
++/// stays. Callers use the result only when the path as written does not
++/// exist, because "." and ".." are legal AmigaDOS names.
++pub fn from_posix(bytes: &[u8]) -> Option<Vec<u8>> {
++    let split = match (bytes.iter().position(|b| *b == b':'), bytes.iter().position(|b| *b == b'/')) {
++        (Some(c), Some(s)) if c < s => c + 1,
++        (Some(c), None) => c + 1,
++        _ => 0,
++    };
++    let (volume, rest) = bytes.split_at(split);
++    let mut parts: Vec<&[u8]> = rest.split(|b| *b == b'/').collect();
++    if !parts.iter().any(|p| *p == b"." || *p == b"..") {
++        return None;
++    }
++    // A single trailing '/' only marks a drawer in AmigaDOS.
++    if parts.len() > 1 && parts.last() == Some(&&b""[..]) {
++        parts.pop();
++    }
++    let mut out = volume.to_vec();
++    for part in parts {
++        match part {
++            b"." => {}
++            b".." | b"" => {
++                if out.len() > volume.len() && !out.ends_with(b"/") {
++                    out.push(b'/');
++                }
++                out.push(b'/');
++            }
++            name => {
++                if out.len() > volume.len() && !out.ends_with(b"/") {
++                    out.push(b'/');
++                }
++                out.extend_from_slice(name);
++            }
++        }
++    }
++    Some(out)
++}
++
++#[cfg(test)]
++mod posix_path_tests {
++    use super::*;
++    fn t(s: &str) -> Option<String> {
++        from_posix(s.as_bytes()).map(|v| String::from_utf8(v).unwrap())
++    }
++    #[test]
++    fn dot_components_become_amigados_steps() {
++        assert_eq!(t("./x").as_deref(), Some("x"));
++        assert_eq!(t("../x").as_deref(), Some("/x"));
++        assert_eq!(t("../../x").as_deref(), Some("//x"));
++        assert_eq!(t("a/../b").as_deref(), Some("a//b"));
++        assert_eq!(t("a/./b").as_deref(), Some("a/b"));
++        assert_eq!(t("..").as_deref(), Some("/"));
++        assert_eq!(t("x/.").as_deref(), Some("x"));
++        assert_eq!(t("RAM:a/../b").as_deref(), Some("RAM:a//b"));
++        assert_eq!(t("RAM:./x").as_deref(), Some("RAM:x"));
++        assert_eq!(t("a//b/../c").as_deref(), Some("a//b//c"));
++    }
++    #[test]
++    fn plain_amigados_paths_are_left_alone() {
++        for p in ["x", "RAM:x", "/x", "a//b", "RAM:", "x/", "..x", "x.."] {
++            assert_eq!(t(p), None, "{p}");
++        }
++    }
++    #[test]
++    fn volume_prefix_only_at_a_volume_root() {
++        assert_eq!(volume_prefix(b"RAM:clean.txt").as_deref(), Some("RAM:"));
++        assert_eq!(volume_prefix(b"Ram Disk:x").as_deref(), Some("Ram Disk:"));
++        assert_eq!(volume_prefix(b"RAM:a/b"), None);
++        assert_eq!(volume_prefix(b"RAM:"), None);
++        assert_eq!(volume_prefix(b"x"), None);
++    }
++}
++
++/// Path::starts_with for AmigaDOS paths. Rust sees "RAM:x" as one component,
++/// so "RAM:x" did not start with "RAM:" and a repository at a volume root
++/// was never matched to the files listed in it.
++pub fn path_starts_with(path: &[u8], prefix: &[u8]) -> bool {
++    if !path.starts_with(prefix) {
++        return false;
++    }
++    path.len() == prefix.len()
++        || matches!(prefix.last(), Some(b':' | b'/'))
++        || path[prefix.len()] == b'/'
++}
++
++#[cfg(test)]
++mod prefix_tests {
++    use super::*;
++    #[test]
++    fn volume_roots_contain_their_files() {
++        assert!(path_starts_with(b"RAM:x", b"RAM:"));
++        assert!(path_starts_with(b"RAM:a/x", b"RAM:a"));
++        assert!(path_starts_with(b"RAM:a", b"RAM:a"));
++        assert!(!path_starts_with(b"RAM:ab", b"RAM:a"));
++        assert!(!path_starts_with(b"RAMX:x", b"RAM"));
++        assert!(path_starts_with(b"RAM:a/x", b"RAM:a/"));
++    }
++}
+diff --git a/src/fs/feature/git.rs b/src/fs/feature/git.rs
+index a6c0bb2..0b95961 100644
+--- a/src/fs/feature/git.rs
++++ b/src/fs/feature/git.rs
+@@ -173,8 +173,19 @@ impl GitRepo {
+ 
+     /// Whether this repository cares about the given path at all.
+     fn has_path(&self, path: &Path) -> bool {
+-        path.starts_with(&self.original_path)
+-            || self.extra_paths.iter().any(|e| path.starts_with(e))
++        #[cfg(target_os = "aros")]
++        {
++            use std::os::unix::ffi::OsStrExt;
++            let within = |base: &Path| {
++                crate::aros_policy::path_starts_with(path.as_os_str().as_bytes(), base.as_os_str().as_bytes())
++            };
++            within(&self.original_path) || self.extra_paths.iter().any(|e| within(e))
++        }
++        #[cfg(not(target_os = "aros"))]
++        {
++            path.starts_with(&self.original_path)
++                || self.extra_paths.iter().any(|e| path.starts_with(e))
++        }
+     }
+ 
+     /// Open a Git repository. Depending on the flags, the path is either
+diff --git a/src/main.rs b/src/main.rs
+index f60c0be..89ba32d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -77,10 +77,10 @@ fn eza_main() {
+     aros::initialize();
+     let stdout_istty = io::stdout().is_terminal();
+     let mut input = String::new();
+-    // AmigaDOS has no "." entry and the C library does not translate it:
+-    // a plain `eza` failed with "\".\": No such file or directory".
++    // Operands in AmigaDOS form (see aros::operand); owned here so that
++    // input_paths can borrow them.
+     #[cfg(target_os = "aros")]
+-    let aros_cwd = aros::current_dir_name();
++    let aros_operands: Vec<OsString>;
+     let mut input_paths: Vec<&OsStr> = match cli.get_many("FILE") {
+         Some(x) => x.map(OsString::as_os_str).collect(),
+         None => vec![],
+@@ -112,10 +112,9 @@ fn eza_main() {
+             }
+ 
+             #[cfg(target_os = "aros")]
+-            for path in &mut input_paths {
+-                if *path == OsStr::new(".") {
+-                    *path = aros_cwd.as_os_str();
+-                }
++            {
++                aros_operands = input_paths.iter().map(|p| aros::operand(p)).collect();
++                input_paths = aros_operands.iter().map(OsString::as_os_str).collect();
+             }
+ 
+             let git = git_options(&options, &input_paths);
+diff --git a/src/output/file_name.rs b/src/output/file_name.rs
+index 9b769b9..6be4990 100644
+--- a/src/output/file_name.rs
++++ b/src/output/file_name.rs
+@@ -326,6 +326,13 @@ impl<C: Colours> FileName<'_, '_, C> {
+         {
+             self.add_parent_bits(&mut bits, parent);
+         }
++        #[cfg(target_os = "aros")]
++        if self.file.parent_dir.is_none() && self.options.absolute == Absolute::Off {
++            use std::os::unix::ffi::OsStrExt;
++            if let Some(volume) = crate::aros_policy::volume_prefix(self.file.path.as_os_str().as_bytes()) {
++                bits.push(self.colours.symlink_path().paint(volume));
++            }
++        }
+ 
+         if !self.file.name.is_empty() {
+             // The “missing file” colour seems like it should be used here,

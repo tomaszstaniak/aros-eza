@@ -1,0 +1,18 @@
+Directory-lifetime probes (diagnostic, no installation). Build both with
+`python3 scripts/eza.py native --build-root ROOT` (same target, build-std,
+panic=abort and libc as eza). Run from RAM:; the optional last argument is a
+result tag, so names on RESULTS: never repeat.
+
+RAM:dirprobe-c fixture          160 drawers, one entry each, in
+                                RAM:eza-dirprobe-997b9f64; refuses reuse
+RAM:dirprobe-c scan TAG         open, read, close each: expected DONE failures=0
+RAM:dirprobe-rust scan TAG      the same through std::fs::read_dir
+RAM:dirprobe-rust hold TAG      keep every DirEntry (and so its stream) open
+RAM:dirprobe-c hold TAG         keep every DIR open
+RAM:dirprobe-c cleanup          delete exactly that fixture
+
+The hold modes crash crt.library (__setfdesc) on ABIv11 when the descriptor
+table fills (observed at d124 with both). Run them last, in a boot of their
+own (tests/native/c7-rusthold.aros), and power-cycle afterwards. Each probe
+writes RESULTS:ecrash-{c|rust}-{scan|hold}-TAG.txt, flushing BEFORE/AFTER
+lines per drawer so the log survives the crash.

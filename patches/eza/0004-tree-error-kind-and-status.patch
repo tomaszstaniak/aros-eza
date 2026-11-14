@@ -1,0 +1,218 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] Keep directory error kind and status through tree output
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001 0002 0003
+Upstream-Status: candidate (all platforms)
+Scope: src/main.rs, src/output/details.rs; exit codes 1 (runtime) and 13
+(permission denied) as already defined by eza.
+
+0002 made tree rendering report child read failures as one generic
+io::Error::other, which print_files then propagated with "?" as if output had
+failed: later operands were skipped and a permission failure became code 1.
+Carry the first error (a permission error wins) as a typed
+DirectoryReadError with its original kind, treat it as a status rather than
+an output failure, combine with max(), and never lower an earlier nonzero
+status when a later directory is denied.
+
+Verification: host unit tests tree_failure_keeps_kind_and_status and
+tree_permission_error_does_not_skip_later_operand (src/main.rs).
+Removal: drop with 0002 when upstream propagates directory errors itself.
+
+diff --git a/src/main.rs b/src/main.rs
+index 3069587..eaabbec 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -326,7 +326,7 @@ impl Exa<'_> {
+         let is_only_dir = dirs.len() == 1 && no_files;
+ 
+         self.options.filter.filter_argument_files(&mut files);
+-        self.print_files(None, files)?;
++        exit_status = exit_status.max(self.print_files_status(None, files)?);
+ 
+         self.print_dirs(dirs, no_files, is_only_dir, exit_status)
+     }
+@@ -351,7 +351,7 @@ impl Exa<'_> {
+                 Err(e) => {
+                     exit_status = exit_status.max(exits::RUNTIME_ERROR);
+                     if e.kind() == ErrorKind::PermissionDenied {
+-                        exit_status = exits::PERMISSION_DENIED;
++                        exit_status = exit_status.max(exits::PERMISSION_DENIED);
+                         eprintln!(
+                             "Permission denied: {} - code: {}",
+                             dir.path.display(),
+@@ -424,7 +424,7 @@ impl Exa<'_> {
+                         .map(fs::File::to_dir)
+                         .collect::<Vec<Dir>>();
+ 
+-                    self.print_files(Some(dir), children)?;
++                    exit_status = exit_status.max(self.print_files_status(Some(dir), children)?);
+                     match self.print_dirs(child_dirs, false, false, exit_status) {
+                         Ok(child_status) => exit_status = exit_status.max(child_status),
+                         Err(e) => return Err(e),
+@@ -433,7 +433,7 @@ impl Exa<'_> {
+                 }
+             }
+ 
+-            self.print_files(Some(dir), children)?;
++            exit_status = exit_status.max(self.print_files_status(Some(dir), children)?);
+         }
+ 
+         if !denied_dirs.is_empty() {
+@@ -449,6 +449,17 @@ impl Exa<'_> {
+         Ok(exit_status)
+     }
+ 
++    /// Keep already-rendered directory failures distinct from output failures.
++    fn print_files_status(&mut self, dir: Option<&Dir>, files: Vec<File<'_>>) -> io::Result<i32> {
++        match self.print_files(dir, files) {
++            Ok(()) => Ok(exits::SUCCESS),
++            Err(error) if error.get_ref().is_some_and(|e| e.is::<details::DirectoryReadError>()) => {
++                Ok(if error.kind() == ErrorKind::PermissionDenied { exits::PERMISSION_DENIED } else { exits::RUNTIME_ERROR })
++            }
++            Err(error) => Err(error),
++        }
++    }
++
+     /// Prints the list of files using whichever view is selected.
+     fn print_files(&mut self, dir: Option<&Dir>, mut files: Vec<File<'_>>) -> io::Result<()> {
+         if files.is_empty() {
+@@ -626,4 +637,29 @@ mod directory_error_tests {
+   assert!(application_for(&["eza","-T"]).print_files(None,vec![file]).is_err());
+  }
+ 
++ #[test]fn tree_failure_keeps_kind_and_status(){
++  let path=env::temp_dir().join(format!("eza-tree-status-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++  std::fs::create_dir(&path).unwrap();
++  let file=File::from_args(path.clone(),None,None,false,false,None);
++  assert!(file.is_directory());std::fs::remove_dir(&path).unwrap();
++  let error=application_for(&["eza","-T"]).print_files(None,vec![file]).unwrap_err();
++  assert_eq!(error.kind(),ErrorKind::NotFound);
++  assert!(error.get_ref().unwrap().is::<details::DirectoryReadError>());
++ }
++ #[cfg(unix)]
++ #[test]fn tree_permission_error_does_not_skip_later_operand(){
++  use std::os::unix::fs::PermissionsExt;
++  let root=env::temp_dir().join(format!("eza-tree-permission-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++  std::fs::create_dir(&root).unwrap();let first=root.join("first");let denied=first.join("denied");
++  std::fs::create_dir(&first).unwrap();std::fs::create_dir(&denied).unwrap();
++  std::fs::set_permissions(&denied,std::fs::Permissions::from_mode(0)).unwrap();
++  // Do not silently pass this test when privileges bypass permissions.
++  let denied_error=std::fs::read_dir(&denied).err();
++  if denied_error.is_none(){std::fs::set_permissions(&denied,std::fs::Permissions::from_mode(0o700)).unwrap();std::fs::remove_dir_all(&root).unwrap();return;}
++  let missing=root.join("later-missing");
++  let result=application_for(&["eza","-T"]).print_dirs(vec![Dir::new(first),Dir::new(missing)],true,false,2);
++  std::fs::set_permissions(&denied,std::fs::Permissions::from_mode(0o700)).unwrap();std::fs::remove_dir_all(&root).unwrap();
++  assert_eq!(result.unwrap(),exits::PERMISSION_DENIED);
++ }
++
+ }
+diff --git a/src/output/details.rs b/src/output/details.rs
+index 113c7dd..2471d77 100644
+--- a/src/output/details.rs
++++ b/src/output/details.rs
+@@ -128,6 +128,17 @@ pub struct Options {
+     pub follow_links: bool,
+ }
+ 
++/// A rendered directory failure, distinct from an output writer failure.
++#[derive(Debug)]
++pub(crate) struct DirectoryReadError(pub io::Error);
++impl std::fmt::Display for DirectoryReadError {
++ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
++}
++impl std::error::Error for DirectoryReadError {}
++fn retain_error(current: &mut Option<io::Error>, error: io::Error) {
++ if current.is_none() || error.kind() == io::ErrorKind::PermissionDenied { *current = Some(error); }
++}
++
+ pub struct Render<'a> {
+     pub dir: Option<&'a Dir>,
+     pub files: Vec<File<'a>>,
+@@ -169,7 +180,7 @@ impl<'a> AsRef<File<'a>> for Egg<'a> {
+ impl<'a> Render<'a> {
+     pub fn render<W: Write>(mut self, w: &mut W) -> io::Result<()> {
+         let mut rows = Vec::new();
+-        let mut had_errors = false;
++        let mut directory_error = None;
+ 
+         let color_scale_info = ColorScaleInformation::from_color_scale(
+             self.opts.color_scale,
+@@ -214,32 +225,32 @@ impl<'a> Render<'a> {
+             // This is weird, but I can’t find a way around it:
+             // https://internals.rust-lang.org/t/should-option-mut-t-implement-copy/3715/6
+             let mut table = Some(table);
+-            had_errors |= self.add_files_to_table(
++            if let Some(error) = self.add_files_to_table(
+                 &mut table,
+                 &mut rows,
+                 &self.files,
+                 TreeDepth::root(),
+                 color_scale_info,
+-            );
++            ) { retain_error(&mut directory_error, error); }
+ 
+             for row in self.iterate_with_table(table.unwrap(), rows) {
+                 writeln!(w, "{}", row.strings())?;
+             }
+         } else {
+-            had_errors |= self.add_files_to_table(
++            if let Some(error) = self.add_files_to_table(
+                 &mut None,
+                 &mut rows,
+                 &self.files,
+                 TreeDepth::root(),
+                 color_scale_info,
+-            );
++            ) { retain_error(&mut directory_error, error); }
+ 
+             for row in self.iterate(rows) {
+                 writeln!(w, "{}", row.strings())?;
+             }
+         }
+ 
+-        if had_errors { Err(io::Error::other("One or more directories could not be read")) } else { Ok(()) }
++        if let Some(error) = directory_error { Err(io::Error::new(error.kind(), DirectoryReadError(error))) } else { Ok(()) }
+     }
+ 
+     /// The root path(s) to recurse when computing the `--loc` percentage
+@@ -274,9 +285,9 @@ impl<'a> Render<'a> {
+         src: &[File<'dir>],
+         depth: TreeDepth,
+         color_scale_info: Option<ColorScaleInformation>,
+-    ) -> bool {
++    ) -> Option<io::Error> {
+         use crate::fs::feature::xattr;
+-        let mut had_errors = false;
++        let mut directory_error = None;
+ 
+         #[cfg(target_os = "aros")]
+         let input = src.iter();
+@@ -356,7 +367,7 @@ impl<'a> Render<'a> {
+         for (tree_params, egg) in depth.iterate_over(file_eggs.into_iter()) {
+             let mut files = Vec::new();
+             let errors = egg.errors;
+-            had_errors |= !errors.is_empty();
++            for (error, _) in &errors { retain_error(&mut directory_error, io::Error::new(error.kind(), error.to_string())); }
+ 
+             if let (Some(ref mut t), Some(row)) = (table.as_mut(), egg.table_row.as_ref()) {
+                 t.add_widths(row);
+@@ -407,7 +418,7 @@ impl<'a> Render<'a> {
+                         ));
+                     }
+ 
+-                    had_errors |= self.add_files_to_table(table, rows, &files, depth.deeper(), color_scale_info);
++                    if let Some(error) = self.add_files_to_table(table, rows, &files, depth.deeper(), color_scale_info) { retain_error(&mut directory_error, error); }
+                     continue;
+                 }
+             }
+@@ -427,7 +438,7 @@ impl<'a> Render<'a> {
+                 rows.push(r);
+             }
+         }
+-        had_errors
++        directory_error
+     }
+ 
+     #[must_use]

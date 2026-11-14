@@ -1,0 +1,10 @@
+{
+  "aros_gcc": "/path/to/aarch64-aros-clang",
+  "aros_ar": "/path/to/aarch64-aros-ar",
+  "aros_sdk": "/path/to/matching/Developer",
+  "rust_aros": "/path/to/rust-aros",
+  "rust_aros_commit": "bf47cdfb60084264256399dd47fcf4a5dbd71dab",
+  "toolchain": "aros-v1-x86-gate-20261028",
+  "pomaros_hosted": "/path/to/pomaros-hosted",
+  "glue_patches": "patches/platform/aros-glue"
+}

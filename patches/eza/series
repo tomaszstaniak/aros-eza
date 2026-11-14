@@ -1,0 +1,10 @@
+0001-aros-platform.patch
+0002-directory-errors-exit-status.patch
+0003-dir-entries-without-open-streams.patch
+0004-tree-error-kind-and-status.patch
+0005-aros-presentation-icons-links.patch
+0006-aros-canonical-paths.patch
+0007-aros-own-stack.patch
+0008-aros-parent-reference-display.patch
+0009-aros-review-fixes.patch
+0010-aros-posix-operands-volume-names.patch

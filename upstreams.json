@@ -1,0 +1,9 @@
+{
+  "repositories": {
+    "eza": {
+      "url": "https://github.com/eza-community/eza.git",
+      "commit": "98442ab17c2c3738701b62a7e060b1431ae2d6ea",
+      "tag": "v0.23.5"
+    }
+  }
+}

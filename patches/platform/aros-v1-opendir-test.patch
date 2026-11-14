@@ -1,0 +1,419 @@
+From 3481577dfc166fe66a07bddf1ff3f7bbb0add001 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <68373859+tomaszstaniak@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 01:59:03 +0200
+Subject: [PATCH 2/2] posixc: test-only failure points for descriptor slots,
+ and an opendir test
+
+A posixc.library built with 'make compiler-posixc POSIXC_FAULT_INJECTION=yes'
+fails __getfdslot() once at a named point when the calling process's local
+variable posixc_fault says so: 'grow' makes growing the descriptor array
+fail, 'reserve' makes the number refused as fd.library would refuse it
+(EMFILE, FD_Reserve() not called). 'probe' fails nothing and is consumed by
+every slot request, so a test can tell such a build from a regular one. The
+variable is deleted when it is used. Only DOS processes are checked; plain
+Exec tasks have no local variables. Regular builds compile none of this.
+
+developer/debug/test/crt/posixc/opendir_slotfail first arms 'probe' and
+skips only when a regular posixc leaves it unconsumed. Then it checks that
+opendir() returns NULL with ENOMEM or EMFILE, releases the directory lock,
+keeps memory steady over repeated failures, and works again once nothing is
+armed. Once failure points are known to exist, a point that is not reached
+fails the test; reaching 'grow' is retried with more drawers held open, a
+bounded number of times. 'selfcheck' arms an unknown point and must fail.
+Arming is checked. Its drawers get names of their own; existing objects are
+refused and never deleted.
+---
+ compiler/crt/posixc/__fdesc.c                 |  55 ++++
+ compiler/crt/posixc/mmakefile.src             |   6 +
+ developer/debug/test/crt/posixc/mmakefile.src |   1 +
+ .../debug/test/crt/posixc/opendir_slotfail.c  | 262 ++++++++++++++++++
+ 4 files changed, 324 insertions(+)
+ create mode 100644 developer/debug/test/crt/posixc/opendir_slotfail.c
+
+diff --git a/compiler/crt/posixc/__fdesc.c b/compiler/crt/posixc/__fdesc.c
+index f01baf10..399b4776 100644
+--- a/compiler/crt/posixc/__fdesc.c
++++ b/compiler/crt/posixc/__fdesc.c
+@@ -224,6 +224,45 @@ int __getfirstfd(register int startfd)
+     }
+ }
+ 
++#ifdef POSIXC_FAULT_INJECTION
++/*
++ * Test builds only (make compiler-posixc POSIXC_FAULT_INJECTION=yes): when the
++ * calling process's local variable "posixc_fault" names a failure point, that
++ * point fails once and the variable is deleted. "probe" fails nothing; it is
++ * consumed by the check at the start of every __getfdslot() call, so a test
++ * can tell that this build has failure points. The variable belongs to one
++ * process, so other tasks are never affected; plain Exec tasks have no local
++ * variables and are skipped before GetVar(), which would read pr_LocalVars.
++ * Only descriptors above the standard streams are checked: those for 0..2 are
++ * taken while posixc opens, before dos.library may be used here. Regular
++ * builds contain none of this.
++ */
++static int __fault(int fd, const char *point)
++{
++    char value[16];
++    const char *p, *v;
++
++    if (fd <= STDERR_FILENO || FindTask(NULL)->tc_Node.ln_Type != NT_PROCESS ||
++        GetVar("posixc_fault", value, sizeof value, GVF_LOCAL_ONLY) <= 0)
++        return 0;
++    for (p = "probe", v = value; *p && *p == *v; p++, v++)
++        ;
++    if (!*p && !*v) {
++        DeleteVar("posixc_fault", GVF_LOCAL_ONLY);
++        return 0;
++    }
++    if (!point)
++        return 0;
++    p = point;
++    v = value;
++    while (*p && *p == *v) { p++; v++; }
++    if (*p || *v)
++        return 0;
++    DeleteVar("posixc_fault", GVF_LOCAL_ONLY);
++    return 1;
++}
++#endif
++
+ int __getfdslot(int wanted_fd)
+ {
+     struct PosixCIntBase *PosixCBase =
+@@ -239,6 +278,11 @@ int __getfdslot(int wanted_fd)
+     if (wanted_fd == __FD_FIRSTFREE)
+         wanted_fd = __getfirstfd(0);
+ 
++#ifdef POSIXC_FAULT_INJECTION
++    /* Consumes "probe" on every call; fails nothing. */
++    (void)__fault(wanted_fd, NULL);
++#endif
++
+     if (wanted_fd>=FD_SLOTS(PosixCBase))
+     {
+         void *tmp;
+@@ -248,6 +292,11 @@ int __getfdslot(int wanted_fd)
+            range are already NULL. Do not call memset()/other stdc helpers
+            here: __getfdslot() runs during posixc OpenLib (via __init_stdfiles)
+            before stdc.library's relbase is available. */
++#ifdef POSIXC_FAULT_INJECTION
++        if (__fault(wanted_fd, "grow"))
++            tmp = NULL;
++        else
++#endif
+         tmp = AllocPooled(FD_POOL(PosixCBase), (wanted_fd+1)*sizeof(fdesc *));
+ 
+         if (!tmp) {
+@@ -298,6 +347,12 @@ int __getfdslot(int wanted_fd)
+            would fail and abort the child's posixc OpenLib (seen as a spurious
+            ENOMEM from fork()).  Only reserve numbers not already owned by us. */
+         if (FD_GetOwner(wanted_fd) != FD_OWNER_POSIXC) {
++#ifdef POSIXC_FAULT_INJECTION
++            /* As if fd.library refused the number; FD_Reserve() is not called. */
++            if (__fault(wanted_fd, "reserve"))
++                error = EMFILE;
++            else
++#endif
+             error = FD_Reserve(wanted_fd, FD_OWNER_POSIXC, NULL);
+             if (error) {
+                 FD_UNLOCK(PosixCBase);
+diff --git a/compiler/crt/posixc/mmakefile.src b/compiler/crt/posixc/mmakefile.src
+index 38c59a95..7bc90d90 100644
+--- a/compiler/crt/posixc/mmakefile.src
++++ b/compiler/crt/posixc/mmakefile.src
+@@ -339,6 +339,12 @@ USER_CPPFLAGS += \
+ 
+ #USER_CPPFLAGS += -DDEBUG=1
+ 
++# Failure points for developer/debug/test/crt/posixc/opendir_slotfail; never
++# set for a regular build.
++ifeq ($(POSIXC_FAULT_INJECTION),yes)
++USER_CPPFLAGS += -DPOSIXC_FAULT_INJECTION
++endif
++
+ USER_LDFLAGS := -noposixc
+ 
+ POSIXC_LINKOBJS := $(addsuffix .o,$(addprefix $(GENDIR)/$(CURDIR)/posixc/,$(notdir $(POSIXC_COMMON))))
+diff --git a/developer/debug/test/crt/posixc/mmakefile.src b/developer/debug/test/crt/posixc/mmakefile.src
+index 765fc2f8..3046fe7b 100644
+--- a/developer/debug/test/crt/posixc/mmakefile.src
++++ b/developer/debug/test/crt/posixc/mmakefile.src
+@@ -20,6 +20,7 @@ POSIXCTESTFILES := \
+         mnt_names \
+         open \
+         opendir \
++        opendir_slotfail \
+         pipe \
+         statfs \
+         strptime \
+diff --git a/developer/debug/test/crt/posixc/opendir_slotfail.c b/developer/debug/test/crt/posixc/opendir_slotfail.c
+new file mode 100644
+index 00000000..1053a97c
+--- /dev/null
++++ b/developer/debug/test/crt/posixc/opendir_slotfail.c
+@@ -0,0 +1,262 @@
++/*
++    Copyright (C) 2026, The AROS Development Team. All rights reserved.
++
++    opendir() must fail cleanly when posixc cannot provide a descriptor slot.
++    Needs posixc.library built with failure points:
++
++        make compiler-posixc POSIXC_FAULT_INJECTION=yes
++
++    The test sets its own local variable "posixc_fault": "probe" first, which
++    such a build consumes without failing, to learn whether failure points
++    exist; then "grow" (growing the descriptor array fails) or "reserve" (the
++    number is refused as fd.library would refuse it, EMFILE). posixc fails at
++    that point once and deletes the variable. Nothing is patched and no other
++    task is affected. Only when "probe" is not consumed (a regular posixc)
++    does the test skip; once failure points are known to exist, a point that
++    is not reached is a test failure.
++
++    The test creates its two drawers under names of its own, refuses to run
++    if either exists, and deletes only what it created.
++        opendir_slotfail [grow|reserve|selfcheck] [NAME]
++    "grow" or "reserve" runs only that case. "selfcheck" arms a point that
++    posixc does not have and expects the test to report it as not reached
++    and fail (return code 5), never to skip. NAME replaces the generated base
++    name (the second drawer is NAME_held), for checking the refusal.
++*/
++
++#include <exec/memory.h>
++#include <exec/tasks.h>
++#include <proto/exec.h>
++#include <proto/dos.h>
++#include <dos/var.h>
++
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "test.h"
++
++#define ROUNDS 20
++#define HELD 8      /* drawers kept open at most to push the number up */
++
++static DIR *held[HELD];
++static int nheld;
++static char testdir[64], helddir[80];
++static int created_test, created_held;
++
++static int armed(void)
++{
++    char value[16];
++    return GetVar("posixc_fault", value, sizeof value, GVF_LOCAL_ONLY) > 0;
++}
++
++static int arm(const char *point)
++{
++    if (!SetVar("posixc_fault", point, -1, GVF_LOCAL_ONLY))
++    {
++        printf("cannot set posixc_fault (%ld)\n", (long)IoErr());
++        return 0;
++    }
++    return armed();
++}
++
++/* The drawer is unlocked only if opendir() released its lock. */
++static int unlocked(void)
++{
++    BPTR lock = Lock(testdir, EXCLUSIVE_LOCK);
++
++    if (!lock)
++        return 0;
++    UnLock(lock);
++    return 1;
++}
++
++/* One armed opendir(). Returns -1 when the point was not reached (the
++   variable is still there; it is removed), 0 on a wrong result, 1 when
++   opendir() failed with the expected errno and left no lock behind. */
++static int injected(const char *point, int expect)
++{
++    DIR *dir;
++
++    if (!arm(point))
++        return 0;
++    errno = 0;
++    dir = opendir(testdir);
++    if (armed())
++    {
++        DeleteVar("posixc_fault", GVF_LOCAL_ONLY);
++        if (dir)
++            closedir(dir);
++        return -1;
++    }
++    if (dir)
++    {
++        /* Not closed: with descriptor -1, closedir() would act on memory
++           before the descriptor array again. */
++        printf("opendir returned %p with descriptor %d after an injected failure\n",
++               dir, dirfd(dir));
++        return 0;
++    }
++    if (errno != expect)
++    {
++        printf("errno %d, expected %d\n", errno, expect);
++        return 0;
++    }
++    return unlocked();
++}
++
++/* The array grows only when the next number lies above it, and a number
++   freed by another descriptor may be reused instead. Keep one more drawer
++   open before each try, so that the number rises, a bounded number of
++   times. */
++static int injected_grow(const char *point, int expect)
++{
++    int r;
++
++    for (;;)
++    {
++        r = injected(point, expect);
++        if (r != -1 || nheld == HELD)
++            return r;
++        if (!(held[nheld] = opendir(helddir)))
++            return 0;
++        nheld++;
++    }
++}
++
++/* Failure points are known to exist; not reaching one is a failure. */
++static int reached(const char *point, int r)
++{
++    if (r == -1)
++        printf("failure point %s not reached\n", point);
++    return r == 1;
++}
++
++static int repeated(const char *point, int expect)
++{
++    ULONG mem = AvailMem(MEMF_ANY);
++    int i;
++
++    for (i = 1; i < ROUNDS; i++)
++        if (!reached(point, injected(point, expect)))
++            return 0;
++    printf("memory after %d more %s failures: %ld bytes difference\n",
++           ROUNDS - 1, point, (long)AvailMem(MEMF_ANY) - (long)mem);
++    return (long)mem - (long)AvailMem(MEMF_ANY) < 4096;
++}
++
++/* Create a drawer that must not exist yet; remember that it is ours. */
++static int create_own(const char *name, int *created)
++{
++    BPTR lock = Lock(name, ACCESS_READ);
++
++    if (lock)
++    {
++        UnLock(lock);
++        printf("%s exists; refusing to use it\n", name);
++        return 0;
++    }
++    lock = CreateDir(name);
++    if (!lock)
++    {
++        printf("cannot create %s (%ld)\n", name, (long)IoErr());
++        return 0;
++    }
++    UnLock(lock);
++    *created = 1;
++    return 1;
++}
++
++int main(int argc, char **argv)
++{
++    DIR *dir;
++    struct dirent *de;
++    int fd, i, grow = 1, reserve = 1, selfcheck = 0;
++    const char *base = NULL;
++
++    for (i = 1; i < argc; i++)
++    {
++        if (!strcmp(argv[i], "grow"))
++            reserve = 0;
++        else if (!strcmp(argv[i], "reserve"))
++            grow = 0;
++        else if (!strcmp(argv[i], "selfcheck"))
++            selfcheck = 1;
++        else
++            base = argv[i];
++    }
++    if (base)
++        snprintf(testdir, sizeof testdir, "%s", base);
++    else
++        snprintf(testdir, sizeof testdir, "RAM:opendir_slotfail_%lx",
++                 (unsigned long)(IPTR)FindTask(NULL));
++    snprintf(helddir, sizeof helddir, "%s_held", testdir);
++    TEST(create_own(testdir, &created_test));
++    TEST(create_own(helddir, &created_held));
++
++    /* Does this posixc have failure points? "probe" fails nothing. */
++    TEST(arm("probe"));
++    dir = opendir(testdir);
++    TEST(dir != NULL);
++    TEST(closedir(dir) == 0);
++    if (armed())
++    {
++        printf("posixc.library has no failure points "
++               "(build it with POSIXC_FAULT_INJECTION=yes): test skipped\n");
++        cleanup();
++        return OK;
++    }
++
++    if (selfcheck)
++    {
++        /* Regression: an unreached point must fail the test, not skip it. */
++        TEST(reached("selfcheck-unknown", injected_grow("selfcheck-unknown", ENOMEM)));
++        cleanup();
++        return OK;
++    }
++
++    /* fd.library refuses the number: its error is kept. */
++    if (reserve)
++    {
++        TEST(reached("reserve", injected("reserve", EMFILE)));
++        TEST(repeated("reserve", EMFILE));
++    }
++
++    /* Growing the array fails: ENOMEM. */
++    if (grow)
++    {
++        TEST(reached("grow", injected_grow("grow", ENOMEM)));
++        TEST(repeated("grow", ENOMEM));
++    }
++
++    /* Nothing armed: opendir() works and the descriptor is real. */
++    TEST(!armed());
++    dir = opendir(testdir);
++    TEST(dir != NULL);
++    fd = dirfd(dir);
++    TEST(fd > STDERR_FILENO && fcntl(fd, F_GETFD) != -1);
++    errno = 0;
++    while ((de = readdir(dir)))
++        ;
++    TEST(errno == 0);
++    TEST(closedir(dir) == 0);
++    TEST(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
++
++    cleanup();
++    return OK;
++}
++
++void cleanup(void)
++{
++    DeleteVar("posixc_fault", GVF_LOCAL_ONLY);
++    while (nheld > 0)
++        closedir(held[--nheld]);
++    /* Only what this run created, so an existing object is never removed. */
++    if (created_held && DeleteFile(helddir))
++        created_held = 0;
++    if (created_test && DeleteFile(testdir))
++        created_test = 0;
++}
+-- 
+2.54.0 (Apple Git-157)
+

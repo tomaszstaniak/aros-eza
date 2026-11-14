@@ -1,0 +1,67 @@
+FailAt 21
+C:UnZip >RESULTS:ez3-unzip-b2d5e8.txt RAM:ezt/Eza-0.23.5-aros-candidate11-abiv11.zip -d RAM:demo
+Echo $RC >RESULTS:ez3-unzip-b2d5e8.rc
+C:UnZip >RESULTS:ez3-unzipgit-b2d5e8.txt RAM:ezt/git-fixture.zip -d RAM:ez3git-b2d5e8
+Echo $RC >RESULTS:ez3-unzipgit-b2d5e8.rc
+C:UnZip >RESULTS:ez3-unzipgitroot-b2d5e8.txt RAM:ezt/gitroot.zip -d RAM:
+Echo $RC >RESULTS:ez3-unzipgitroot-b2d5e8.rc
+Protect RAM:demo/Eza/eza +e
+Protect RAM:ezt/acceptance +e
+Protect RAM:ezt/dirprobe-c +e
+Protect RAM:ezt/dirprobe-rust +e
+Protect RAM:ezt/git_status +e
+Protect RAM:ezt/test_file_link_aros +e
+Protect RAM:ezt/test_icon_font +e
+Protect RAM:ezt/LimpetT/Limpet +e
+List RAM:demo/Eza/eza >RESULTS:ez3-list-exe-b2d5e8.txt
+RAM:ezt/dirprobe-c fixture b2d5e8
+Echo $RC >RESULTS:ez3-dpfix-b2d5e8.rc
+RAM:ezt/dirprobe-c scan b2d5e8
+Echo $RC >RESULTS:ez3-dpcscan-b2d5e8.rc
+RAM:ezt/dirprobe-rust scan b2d5e8
+Echo $RC >RESULTS:ez3-dprscan-b2d5e8.rc
+RAM:ezt/acceptance plain
+Echo $RC >RESULTS:ez3-plain-b2d5e8.rc
+Stack >RESULTS:ez3-stack-b2d5e8.txt
+RAM:demo/Eza/eza -Tl -L2 RAM:demo/Eza/LICENSES >RESULTS:ez3-s40-crash-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-crash-b2d5e8.rc
+RAM:demo/Eza/eza -Tl --no-quotes RAM:eza-dirprobe-997b9f64 >RESULTS:ez3-s40-wide-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-wide-b2d5e8.rc
+RAM:demo/Eza/eza -T --no-quotes RAM:ez3-qa-b2d5e8/deep >RESULTS:ez3-s40-deep-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-deep-b2d5e8.rc
+RAM:demo/Eza/eza -la --git --no-time --no-user --no-permissions --no-quotes RAM:ez3git-b2d5e8/git-fixture >RESULTS:ez3-s40-git-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-git-b2d5e8.rc
+RAM:demo/Eza/eza -T --git --git-ignore --no-quotes RAM:ez3git-b2d5e8/git-fixture >RESULTS:ez3-s40-gitignore-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-gitignore-b2d5e8.rc
+RAM:demo/Eza/eza -l --hyperlink=always --icons=always RAM:ez3-qa-b2d5e8/link >RESULTS:ez3-s40-links-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-links-b2d5e8.rc
+RAM:demo/Eza/eza --help >RESULTS:ez3-s40-help-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-help-b2d5e8.rc
+RAM:demo/Eza/eza --version >RESULTS:ez3-s40-version-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-version-b2d5e8.rc
+RAM:demo/Eza/eza --no-such-option >RESULTS:ez3-s40-badopt-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-badopt-b2d5e8.rc
+RAM:demo/Eza/eza RAM:ez3-qa-b2d5e8/missing RAM:ez3-qa-b2d5e8/small >RESULTS:ez3-s40-missing-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-missing-b2d5e8.rc
+; A panic (invalid UTF-8 on --stdin) must leave through the original stack.
+; Its return code 101 is above FailAt 21; the script must go on.
+FailAt 1000
+RAM:demo/Eza/eza --stdin <RAM:ezt/badutf8.txt >RESULTS:ez3-s40-panic-b2d5e8.out
+Echo $RC >RESULTS:ez3-s40-panic-b2d5e8.rc
+FailAt 21
+Echo S40-DONE >RESULTS:ez3-s40-done-b2d5e8.txt
+Run >NIL: Execute RAM:ezt/c8-pipe-reader.aros
+RAM:demo/Eza/eza -1 --color=always --no-quotes RAM:ez3-qa-b2d5e8/tiny >PIPE:ez3-b2d5e8
+Echo $RC >RESULTS:ez3-pipe-writer-b2d5e8.rc
+Set _pchar "|"
+RAM:demo/Eza/eza -1 --color=always --no-quotes RAM:ez3-qa-b2d5e8/tiny | RAM:ezt/acceptance stdin RESULTS:ez3-shellpipe-b2d5e8.out
+Echo $RC >RESULTS:ez3-shellpipe-b2d5e8.rc
+; The C probe calls libgit2 directly and needs more than the 40 KB Shell stack.
+Stack 1048576
+RAM:ezt/git_status RAM:ez3git-b2d5e8/git-fixture RESULTS:ez3-gitprobe-b2d5e8.txt
+Echo $RC >RESULTS:ez3-gitprobe-b2d5e8.rc
+RAM:ezt/test_file_link_aros >RESULTS:ez3-linkprobe-b2d5e8.txt
+Echo $RC >RESULTS:ez3-linkprobe-b2d5e8.rc
+RAM:ezt/test_icon_font RAM:ezt/LimpetT/Fonts/DejaVuSansMNerdFontMono-Regular.ttf FONTS:TrueType/OpenSans-Regular.ttf RAM:ezt/LimpetT/Fonts/NotoEmoji.ttf RAM:ezt/LimpetT/Fonts/Unifont.otf >RESULTS:ez3-iconprobe-b2d5e8.txt
+Echo $RC >RESULTS:ez3-iconprobe-b2d5e8.rc
+Echo PLAIN-DONE >RESULTS:ez3-plain-done-b2d5e8.txt

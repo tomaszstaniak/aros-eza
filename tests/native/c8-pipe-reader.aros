@@ -1,0 +1,3 @@
+FailAt 21
+Type PIPE:ez3-b2d5e8 >RESULTS:ez3-pipe-b2d5e8.out
+Echo $RC >RESULTS:ez3-pipe-reader-b2d5e8.rc

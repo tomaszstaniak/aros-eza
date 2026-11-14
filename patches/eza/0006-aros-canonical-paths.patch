@@ -1,0 +1,105 @@
+From: AROS eza port maintainers
+Date: 2026-10-21
+Subject: [PATCH] AROS: resolve absolute paths with NameFromLock
+Repository: eza
+Base-Commit: 98442ab17c2c3738701b62a7e060b1431ae2d6ea
+Preceding-Patches: 0001 0002 0003 0004 0005
+Upstream-Status: AROS-specific, not for upstream
+Scope: target_os = "aros" only (File::absolute_path, git reorient).
+
+std::fs::canonicalize goes through crt.library realpath(), which does not
+resolve AmigaDOS paths: on AROS One 1.3 (pool v11-1, 2026-10-21) every
+--hyperlink=always name was printed without a link, because absolute_path()
+was None, and Git repositories were looked up under the unresolved path.
+Ask the filesystem for the object's canonical name (Lock + NameFromLock),
+e.g. "RAM Disk:dir/file"; a missing object still gives None as before.
+
+Verification: native results are recorded in the port's validation documents.
+Removal: when std::fs::canonicalize returns AmigaDOS names on AROS.
+
+diff --git a/src/aros.c b/src/aros.c
+index 77f628a..37cedd6 100644
+--- a/src/aros.c
++++ b/src/aros.c
+@@ -14,3 +14,9 @@ int eza_protection(const char *path, unsigned int *bits) {
+  struct FileInfoBlock *fib=AllocDosObject(DOS_FIB,0); int ok=0;
+  if(fib){if(Examine(lock,fib)){*bits=(unsigned int)fib->fib_Protection;ok=1;}FreeDosObject(DOS_FIB,fib);}UnLock(lock);return ok;
+ }
++/* crt.library realpath() does not resolve AmigaDOS paths ("RAM:x" gives
++ * ENOENT), so std::fs::canonicalize fails; the filesystem names the object. */
++int eza_canonical(const char *path, char *out, unsigned int size) {
++ BPTR lock=Lock(path,ACCESS_READ); int ok; if (!lock) return 0;
++ ok=NameFromLock(lock,out,size)!=0; UnLock(lock); return ok;
++}
+diff --git a/src/aros.rs b/src/aros.rs
+index c63e72b..782c562 100644
+--- a/src/aros.rs
++++ b/src/aros.rs
+@@ -6,6 +6,7 @@ unsafe extern "C" {
+     fn eza_query(p: *mut Presentation) -> i32;
+     fn eza_break() -> i32;
+     fn eza_protection(path: *const std::ffi::c_char, bits: *mut u32) -> i32;
++    fn eza_canonical(path: *const std::ffi::c_char, out: *mut std::ffi::c_char, size: u32) -> i32;
+ }
+ static WIDTH: OnceLock<Option<usize>> = OnceLock::new();
+ pub fn width() -> Option<usize> {
+@@ -78,3 +79,16 @@ pub fn icons() -> bool {
+     let p = output_presentation();
+     p.known & 64 != 0 && p.features & 12 == 12
+ }
++
++/// Canonical AmigaDOS name ("RAM Disk:dir/file") of an existing object.
++pub fn canonicalize(path: &std::path::Path) -> Option<std::path::PathBuf> {
++    use std::os::unix::ffi::{OsStrExt, OsStringExt};
++    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
++    let mut buf = vec![0u8; 4096];
++    if unsafe { eza_canonical(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len() as u32) } == 0 {
++        return None;
++    }
++    let end = buf.iter().position(|&b| b == 0)?;
++    buf.truncate(end);
++    Some(std::ffi::OsString::from_vec(buf).into())
++}
+diff --git a/src/fs/feature/git.rs b/src/fs/feature/git.rs
+index e0de969..a6c0bb2 100644
+--- a/src/fs/feature/git.rs
++++ b/src/fs/feature/git.rs
+@@ -350,7 +350,11 @@ fn reorient(path: &Path) -> PathBuf {
+         Ok(dir) => dir.join(path),
+     };
+ 
+-    path.canonicalize().unwrap_or(path)
++    #[cfg(target_os = "aros")]
++    let resolved = crate::aros::canonicalize(&path);
++    #[cfg(not(target_os = "aros"))]
++    let resolved = path.canonicalize().ok();
++    resolved.unwrap_or(path)
+ }
+ 
+ #[cfg(windows)]
+diff --git a/src/fs/file.rs b/src/fs/file.rs
+index c53282e..da48c48 100644
+--- a/src/fs/file.rs
++++ b/src/fs/file.rs
+@@ -408,7 +408,10 @@ impl<'dir> File<'dir> {
+     pub fn absolute_path(&self) -> Option<&PathBuf> {
+         self.absolute_path
+             .get_or_init(|| {
+-                if self.is_link() && self.link_target().is_broken() {
++                #[cfg(target_os = "aros")]
++                let resolved = crate::aros::canonicalize(&self.path);
++                #[cfg(not(target_os = "aros"))]
++                let resolved = if self.is_link() && self.link_target().is_broken() {
+                     // workaround for broken symlinks to get absolute path for parent and then
+                     // append name of file; std::fs::canonicalize requires all path components
+                     // (including the last one) to exist
+@@ -418,7 +421,8 @@ impl<'dir> File<'dir> {
+                         .map(|p| p.join(self.name.clone()))
+                 } else {
+                     std::fs::canonicalize(&self.path).ok()
+-                }
++                };
++                resolved
+             })
+             .as_ref()
+     }

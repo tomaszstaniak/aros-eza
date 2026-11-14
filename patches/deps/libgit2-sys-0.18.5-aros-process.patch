@@ -1,0 +1,40 @@
+--- a/libgit2/src/util/unix/process.c	2026-11-14 11:39:23
++++ b/libgit2/src/util/unix/process.c	2026-11-14 11:39:23
+@@ -346,6 +346,12 @@
+ 
+ int git_process_start(git_process *process)
+ {
++#ifdef __AROS__
++	/* AROS has no fork(): the local-repository build starts no helper program. */
++	GIT_UNUSED(process);
++	git_error_set(GIT_ERROR_OS, "starting a program is unavailable on AROS");
++	return -1;
++#else
+ 	int in[2] = { -1, -1 }, out[2] = { -1, -1 },
+ 	    err[2] = { -1, -1 }, status[2] = { -1, -1 };
+ 	int fdflags, state, error;
+@@ -450,6 +456,7 @@
+ 	CLOSE_FD(err[0]);    CLOSE_FD(err[1]);
+ 	CLOSE_FD(status[0]); CLOSE_FD(status[1]);
+ 	return -1;
++#endif
+ }
+ 
+ int git_process_id(p_pid_t *out, git_process *process)
+@@ -533,11 +540,16 @@
+ 		return -1;
+ 	}
+ 
++#ifndef __AROS__
+ 	if (sigismember(&pending, SIGPIPE) == 1 &&
+ 	    sigwait(&sigpipe_mask, &signal) < 0) {
+ 		git_error_set(GIT_ERROR_OS, "could not wait for (blocking) signal delivery");
+ 		return -1;
+ 	}
++#else
++	/* AROS has no sigwait(); no child process exists whose pipe could raise SIGPIPE. */
++	(void)signal;
++#endif
+ 
+ 	if (pthread_sigmask(SIG_SETMASK, saved_mask, 0) < 0) {
+ 		git_error_set(GIT_ERROR_OS, "could not configure signal mask");
