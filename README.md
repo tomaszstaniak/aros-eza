@@ -10,13 +10,20 @@ eza 0.23.5 in [Limpet](https://tomaszstaniak.github.io/limpet/) 0.10.1 on AROS O
 
 ## Download
 
-[Release 0.23.5-r1](https://github.com/tomaszstaniak/aros-eza/releases/tag/v0.23.5-r1):
+[Release 0.23.5-r3](https://github.com/tomaszstaniak/aros-eza/releases/tag/v0.23.5-r3):
 
 | System | Archive |
 | --- | --- |
-| AROS One and other ABIv11 systems, x86_64 | `Eza-0.23.5-r1-aros-x86_64-abiv11-pc.zip` |
-| mainline AROS (ABIv1), x86_64 | `Eza-0.23.5-r1-aros-x86_64-abiv1-pc.zip` |
-| native AROS on the Raspberry Pi (ABIv1, AArch64) | `Eza-0.23.5-r1-aros-aarch64-abiv1-raspi.zip` |
+| AROS One and other ABIv11 systems, x86_64 | `Eza-0.23.5-r3-aros-x86_64-abiv11-pc.zip` |
+| mainline AROS (ABIv1), x86_64, nightly 2026-11-24 or later | `Eza-0.23.5-r3-aros-x86_64-abiv1-pc.zip` |
+| native AROS on the Raspberry Pi (ABIv1, AArch64), nightly 2026-11-24 or later | `Eza-0.23.5-r3-aros-aarch64-abiv1-raspi.zip` |
+
+For mainline and Pi nightly builds before 2026-11-24, use
+[release 0.23.5-r1](https://github.com/tomaszstaniak/aros-eza/releases/tag/v0.23.5-r1).
+
+In Limpet 0.14.0 or later, TAB completes eza's options and their values
+(`eza --so`, TAB: `--sort`). The package brings the list in
+`Completions/eza`.
 
 With [apkg](https://github.com/tomaszstaniak/arospkg): `apkg install eza`.
 

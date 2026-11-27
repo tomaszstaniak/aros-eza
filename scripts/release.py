@@ -102,6 +102,9 @@ def main():
               if target.endswith("-raspi") else "")
         (drawer / "README.txt").write_text(text.replace("@VERSION@", name).replace("@TARGET@", target)
                                            .replace("@SYSTEM@", TARGETS[target]["system"]).replace("@PI@\n", pi))
+        # What TAB offers after "eza" in Limpet: Completions/eza beside the program.
+        (drawer / "Completions").mkdir()
+        shutil.copy2(ROOT / "packaging" / "Completions" / "eza", drawer / "Completions" / "eza")
         (parent / "Eza.arospkg.toml").write_text(manifest(target, revision))
         apkg = json.loads((ROOT / "local.json").read_text()).get("apkg_pack")
         if not apkg or not Path(apkg).is_file():

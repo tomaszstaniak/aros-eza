@@ -44,6 +44,9 @@ Notes
   Limpet shows the icons with its own font at the default size of 13
   pixels. Ctrl+click on a linked name opens the file as a double-click in
   Workbench would.
+- In Limpet 0.14.0 or later, TAB completes eza's options and their
+  values: "eza --so" and TAB gives --sort, TAB after it the sort orders.
+  The list is the file Completions/eza in this drawer.
 - Names with bytes that are not valid UTF-8 are shown as \xNN.
 - On AROS One, pipes in the Shell need "Set _mchar @@" first.
 @PI@

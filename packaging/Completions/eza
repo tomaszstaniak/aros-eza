@@ -1,0 +1,67 @@
+# eza: options for TAB in Limpet 0.14.0 or later.
+# Made from eza's completions/fish/eza.fish with Limpet's tools/completions/from-fish.py.
+option --version -v
+option --help
+option --oneline -1
+option --long -l
+option --grid -G
+option --across -x
+option --recurse -R
+option --tree -T
+option --dereference -X
+option --classify -F
+option --color --colour always auto automatic never
+option --color-scale --colour-scale all age size
+option --color-scale-mode --colour-scale-mode fixed gradient
+option --icons always auto automatic never
+option --no-quotes
+option --short-nix
+option --hyperlink always auto automatic never
+option --follow-symlinks
+option --absolute on follow off
+option --smart-group
+option --group-directories-first
+option --group-directories-last
+option --git-ignore
+option --all -a
+option --almost-all -A
+option --treat-dirs-as-files -d
+option --level -L 1 2 3 4 5 6 7 8 9
+option --code lines percent both
+option --width -w
+option --reverse -r
+option --sort -s accessed age changed created date ext Ext extension Extension filename Filename inode modified name Name newest none oldest size time type
+option --ignore-glob -I <file>
+option --only-dirs -D
+option --only-files -f
+option --show-symlinks
+option --no-symlinks
+option --binary -b
+option --bytes -B
+option --group -g
+option --header -h
+option --links -H
+option --inode -i
+option --loc lines percent both
+option --blocksize -S
+option --time -t modified changed accessed created
+option --modified -m
+option --numeric -n
+option --changed
+option --accessed -u
+option --created -U
+option --time-style default iso long-iso full-iso relative
+option --total-size
+option --no-permissions
+option --octal-permissions -o
+option --no-filesize
+option --no-user
+option --no-time
+option --mounts -M
+option --stdin
+option --git
+option --no-git
+option --git-repos
+option --git-repos-no-status
+option --extended
+option --context -Z
